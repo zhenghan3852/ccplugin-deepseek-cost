@@ -840,10 +840,26 @@ export const register: Register = (on, options) => {
     // 模型在 session.start 和每一轮里都会更新，所以中途切模型也会跟着变。
     if (!isDeepSeekModel(await read($, modelAtom))) return next(e)
 
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const elements = $.ui.resolve(e)
+    const { Box, Text, Button } = elements
     const balance = await read($, balanceAtom)
     const usage = await read($, usageAtom)
     const error = await read($, errorAtom)
+
+    // 余额拿不到时（没配 Key、或 Key 不对），**就地**给一个输入框。
+    // 横条本身支持 Input（引擎文档：带子里 an Input types, a Button arms the
+    // hotkeys），所以不必另开面板。配好之后 balance 就有了，这个输入框自动消失。
+    let keyInput: RenderElement | null = null
+    if (!balance && error && 'Input' in elements) {
+      const { Input } = elements
+      keyInput = (
+        <Input
+          key="key"
+          placeholder="粘贴 Key 回车存入钥匙串"
+          onSubmit={(text) => void saveKey($, cfg, text)}
+        />
+      )
+    }
 
     // 余额
     let balanceNode: RenderElement | null = null
@@ -889,7 +905,7 @@ export const register: Register = (on, options) => {
     }
 
     // 只在实际画出来的片段之间插分隔符，免得隐藏一栏后留下孤零零的 ·
-    const pieces = [balanceNode, cycleNode, usageNode].filter(
+    const pieces = [balanceNode, keyInput, cycleNode, usageNode].filter(
       (node): node is RenderElement => node !== null,
     )
     const children: RenderNode[] = pieces.flatMap((node, index) =>

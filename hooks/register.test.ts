@@ -638,3 +638,64 @@ test('钥匙串里的 key 优先于环境变量 —— 真的用在余额请求�
 
   expect(sentAuth).toBe('Bearer sk-from-keychain')
 })
+
+test('余额拿不到时，横条上就地出现 Key 输入框', async ($, on) => {
+  mock.env(on, {}) // 没有任何来源的 Key
+  stubEngine(on)
+  stubBalance(on)
+  const runs: string[][] = []
+  on('process.run', ($, e) => {
+    runs.push([...e.argv])
+    return {
+      value: {
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        isStdoutTruncated: false,
+        isStderrTruncated: false,
+      },
+    }
+  })
+  await startSession($, on)
+
+  const band = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: BAND_PROPS,
+  })
+  // 余额位显示失败原因（未配置 Key），旁边就是可输入的框
+  expect(await band.find({ text: '未配置 Key' })).toBeDefined()
+  expect(await band.find({ type: 'Input' })).toBeDefined()
+
+  // 在横条里输入即可写进钥匙串 —— 不用另开面板
+  await band.input({ key: 'key', text: 'sk-from-band' })
+  const write = runs.find((argv) => argv.includes('add-generic-password'))
+  expect(write).toEqual([
+    'security',
+    'add-generic-password',
+    '-U',
+    '-s',
+    'deepseek-cost-hud',
+    '-a',
+    'apiKey',
+    '-w',
+    'sk-from-band',
+  ])
+})
+
+test('余额正常时横条上没有 Key 输入框', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
+  stubBalance(on)
+  await startSession($, on)
+
+  const band = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: BAND_PROPS,
+  })
+  expect(await band.find({ text: '¥40.36' })).toBeDefined()
+  expect(await band.find({ type: 'Input' })).toBeUndefined()
+})
