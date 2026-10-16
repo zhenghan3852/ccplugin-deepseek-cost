@@ -34,8 +34,6 @@ export type Usage = {
   cacheWriteTokens: number
   /** 计入统计的轮次数。 */
   turns: number
-  /** 最近一次回答的模型 id。 */
-  model: string
   /**
    * 逐轮累加的**估算**花费，单位见 `priceCurrency`。
    * 每一轮按该轮发生时刻处于高峰还是错峰选取单价，所以跨时段的长会话会自动
@@ -58,6 +56,11 @@ declare module 'claude-code' {
       usage: Usage
       isHidden: boolean
       error: HudError
+      /**
+       * 当前会话的模型 id（`$.session.model()`，每轮再用该轮的模型校正）。
+       * 非 DeepSeek 的模型既不计价也不显示横条。
+       */
+      model: string
     }
   }
 }

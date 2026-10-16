@@ -53,9 +53,13 @@ function stubBalance(on: On): void {
 /**
  * 引擎自带的接口测试里没人作答，插件用到哪几个就得替哪几个备一个。
  * 横条隐藏时钩子走 next(e)，引擎接着画自己的内容 —— 那条路也要有个替身。
+ *
+ * `session.model` 决定横条出不出现，所以默认给一个 DeepSeek 模型；要测「非
+ * DeepSeek 就整条不画」传别的模型 id 进来。
  */
-function stubEngine(on: On): void {
+function stubEngine(on: On, model = 'deepseek-flash'): void {
   on('command.register', () => ({ value: { command: '' } }))
+  on('session.model', () => ({ value: model }))
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['engine drew its own'] }))
 }
 
@@ -168,8 +172,18 @@ test('花费进度条走满一轮就归零，并标出已经走满的轮数', as
   await startSession($, on)
 
   // 时钟从 0 起步（1970-01-01 周四 00:00 UTC），按错峰算，单价是高峰价的一半：
-  // 3000 万输出 token × ¥8/M × 50% = ¥120 —— 走满一轮后余下 ¥20，即 20%。
-  await $.turn.complete({ ...TURN, usage: { ...TURN.usage, output_tokens: 30_000_000 } })
+  // 26.25 万输出 token × ¥8/M × 50% = ¥1.05。输入与缓存那一份清零，好让进度条
+  // 正好落在 5.0% 上，断言才不含糊。
+  await $.turn.complete({
+    ...TURN,
+    usage: {
+      ...TURN.usage,
+      input_tokens: 0,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      output_tokens: 262_500,
+    },
+  })
 
   const ui = await $.ui.mount({
     plugin: PLUGIN,
@@ -180,6 +194,35 @@ test('花费进度条走满一轮就归零，并标出已经走满的轮数', as
 
   // find 不认 key（键不在挂载出来的 props 里），所以按文本断言整条横条
   const band = await ui.find({ text: /×1/ })
-  expect(band?.text).toMatch(/20\.0%/)
-  expect(band?.text).toMatch(/¥100 ×1/)
+  expect(band?.text).toMatch(/5\.0%/)
+  expect(band?.text).toMatch(/¥1 ×1/)
+})
+
+test('非 DeepSeek 模型时整条横条都不画，那一轮也不进账', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on, 'glm-5.3')
+  stubBalance(on)
+  on('turn.complete', () => ({ text: '' }))
+  await startSession($, on)
+
+  // 走完一轮（这一轮报的也是 glm），钩子仍应直接 next(e)，把这条带子让给引擎
+  await $.turn.complete({ ...TURN, usage: { ...TURN.usage, model: 'glm-5.3' } })
+
+  const ui = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: BAND_PROPS,
+  })
+  expect(await ui.find({ text: /DeepSeek/ })).toBeUndefined()
+
+  // 那一轮不该进账：报告里连用量都不该有，并且把「不计价」说明白
+  const report = await $.command.run({
+    command: 'deepseek-cost',
+    args: '',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: false, columns: 80 },
+  })
+  expect(report.text).toContain('非 DeepSeek 模型')
+  expect(report.text).toContain('还没有走完一轮')
 })

@@ -52,7 +52,6 @@ const EMPTY_USAGE: Usage = {
   cacheReadTokens: 0,
   cacheWriteTokens: 0,
   turns: 0,
-  model: '',
   estimatedCost: 0,
 }
 
@@ -60,6 +59,7 @@ const balanceAtom = atom({ plugin: 'deepseek-cost-hud', key: 'balance' } as cons
 const usageAtom = atom({ plugin: 'deepseek-cost-hud', key: 'usage' } as const, EMPTY_USAGE)
 const hiddenAtom = atom({ plugin: 'deepseek-cost-hud', key: 'isHidden' } as const, false)
 const errorAtom = atom({ plugin: 'deepseek-cost-hud', key: 'error' } as const, null)
+const modelAtom = atom({ plugin: 'deepseek-cost-hud', key: 'model' } as const, '')
 
 // ── 配置 ────────────────────────────────────────────────────────────
 
@@ -128,26 +128,45 @@ function isPeak(atMs: number): boolean {
   return (hour >= 1 && hour < 4) || (hour >= 6 && hour < 10)
 }
 
-/** 某一刻的单价（每百万 token）。 */
-function unitPrices(cfg: Settings, atMs: number) {
-  const factor = isPeak(atMs) ? 1 : cfg.offPeakRatio
-  return {
-    input: cfg.priceInput * factor,
-    cacheRead: cfg.priceCacheRead * factor,
-    output: cfg.priceOutput * factor,
+/**
+ * 按模型计价。表里是官方**人民币高峰价**（每百万 token），错峰由
+ * `offPeakDiscount` 折半。只列这两个模型 —— 官方在售的就是它们两档；
+ * 遇到别的模型（包括别的 deepseek-* 变体）就退回配置里那三个兜底单价。
+ */
+type ModelPrices = { input: number; cacheRead: number; output: number }
+
+const MODEL_PRICES: Record<string, ModelPrices> = {
+  'deepseek-flash': { input: 2, cacheRead: 0.04, output: 8 },
+  'deepseek-v4-pro': { input: 9, cacheRead: 0.3, output: 27 },
+}
+
+function peakPricesFor(model: string, cfg: Settings): ModelPrices {
+  return MODEL_PRICES[model] ?? {
+    input: cfg.priceInput,
+    cacheRead: cfg.priceCacheRead,
+    output: cfg.priceOutput,
   }
+}
+
+/**
+ * 是不是 DeepSeek 的模型。非 DeepSeek（走别的网关时会出现 glm-5.3 这类）既不
+ * 计价也不显示横条 —— 拿 DeepSeek 的价目折算别的模型没有意义。
+ */
+function isDeepSeekModel(model: string): boolean {
+  return /^deepseek/i.test(model.trim())
 }
 
 type Tokens = Pick<Usage, 'inputTokens' | 'outputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'>
 
-/** 一组 token 数按某一刻的单价折算成钱。 */
-function costOf(tokens: Tokens, cfg: Settings, atMs: number): number {
-  const price = unitPrices(cfg, atMs)
+/** 一组 token 数按某套单价、某一刻的高低谷折算成钱。 */
+function costOf(tokens: Tokens, cfg: Settings, peak: ModelPrices, atMs: number): number {
+  const factor = isPeak(atMs) ? 1 : cfg.offPeakRatio
   // 写入缓存的输入按未命中价计费
   return (
-    ((tokens.inputTokens + tokens.cacheWriteTokens) / 1e6) * price.input +
-    (tokens.cacheReadTokens / 1e6) * price.cacheRead +
-    (tokens.outputTokens / 1e6) * price.output
+    (((tokens.inputTokens + tokens.cacheWriteTokens) / 1e6) * peak.input +
+      (tokens.cacheReadTokens / 1e6) * peak.cacheRead +
+      (tokens.outputTokens / 1e6) * peak.output) *
+    factor
   )
 }
 
@@ -189,7 +208,7 @@ function renderBar(percent: number, width = 10): string {
 }
 
 /** 进度条每走满这么多就归零重来，单位与 priceCurrency 一致。 */
-const CYCLE_BUDGET = 100
+const CYCLE_BUDGET = 1
 
 /**
  * 本会话估算花费在**当前这一轮**里的位置。
@@ -315,6 +334,16 @@ async function refreshBalance($: EngineInterface, cfg: Settings): Promise<void> 
   }
 }
 
+/** 读一次当前会话的模型写进状态 —— 横条出不出现、按哪套价算钱都看它。 */
+async function refreshModel($: EngineInterface): Promise<void> {
+  try {
+    const model = await $.session.model()
+    if (model?.trim()) await update($, modelAtom, () => model.trim())
+  } catch {
+    // 拿不到就先当没有；每一轮的 turn.complete 还会再校正一次
+  }
+}
+
 /** `/deepseek-cost` 的完整报告：本会话用量明细 + 按单价折算出来的花费。 */
 async function costReport($: EngineInterface, cfg: Settings): Promise<string> {
   const balance = await read($, balanceAtom)
@@ -325,6 +354,19 @@ async function costReport($: EngineInterface, cfg: Settings): Promise<string> {
     rows.push(`余额        ${money(balance.total, currencySymbol(balance.currency))}（充值 ${balance.toppedUp.toFixed(2)} + 赠送 ${balance.granted.toFixed(2)}）`)
   } else {
     rows.push('余额        尚未取到（用 /deepseek-key 配 Key，或设 DEEPSEEK_API_KEY）')
+  }
+
+  // 花费是按模型折算的，所以先把「按哪个模型、哪套价」交代清楚
+  const model = (await read($, modelAtom)) || '未知'
+  const known = MODEL_PRICES[model]
+  if (!isDeepSeekModel(model)) {
+    rows.push(`模型        ${model}   （非 DeepSeek 模型：不计价，横条也不显示）`)
+  } else if (known) {
+    rows.push(
+      `模型        ${model}   （内置高峰价 ${known.input} / ${known.cacheRead} / ${known.output} 元每百万 token，错峰减半）`,
+    )
+  } else {
+    rows.push(`模型        ${model}   （不在内置价目表里，用配置里的兜底单价）`)
   }
 
   if (usage.turns === 0) {
@@ -389,8 +431,9 @@ export const register: Register = (on, options) => {
       argumentHint: 'sk-...',
     })
 
-    // 3) 拉一次真实余额（有缓存也拉，让数字尽快变准）
+    // 3) 拉一次真实余额（有缓存也拉，让数字尽快变准），再看清用的是哪个模型
     await refreshBalance($, cfg)
+    await refreshModel($)
 
     // 4) 起定时刷新。定时器归引擎的时钟管，钩子这一趟结束也照样跑，
     //    直到 cancel() 或模块被重载（重载会把上一个环境的定时器一并丢掉，
@@ -423,31 +466,37 @@ export const register: Register = (on, options) => {
   // `turn.complete` 带的是「本轮真实请求的 token 数」之和，把整条会话加起来
   // 就是本会话的真实用量。子 agent 的轮次也会走到这里 —— 那同样是真花掉的钱。
   //
-  // 估算的那一份在这里就地结算：用这一轮发生的时刻去选单价，于是跨高峰/错峰的
-  // 长会话会自动把两种价都算进去，而不是拿一个价乘全部。
+  // 估算的那一份在这里就地结算：单价按这一轮的**模型**选，再按该轮发生的时刻
+  // 选高峰/错峰，于是混合模型、跨时段的会话都能各算各的。非 DeepSeek 的轮次
+  // 直接不进账 —— 横条讲的是 DeepSeek 的花费。
 
   on('turn.complete', async ($, e, next) => {
     const used = e.usage
     if (used) {
-      const now = await $.clock.now()
-      const tokens: Tokens = {
-        inputTokens: used.input_tokens ?? 0,
-        outputTokens: used.output_tokens ?? 0,
-        cacheReadTokens: used.cache_read_input_tokens ?? 0,
-        cacheWriteTokens: used.cache_creation_input_tokens ?? 0,
-      }
-      const turnCost = costOf(tokens, cfg, now)
+      // 这一轮是谁在跑：优先用响应里报的模型，没有就退回会话模型
+      const model = (used.model || (await read($, modelAtom))).trim()
+      if (model) await update($, modelAtom, () => model)
 
-      await update($, usageAtom, prev => ({
-        ...prev,
-        inputTokens: prev.inputTokens + tokens.inputTokens,
-        outputTokens: prev.outputTokens + tokens.outputTokens,
-        cacheReadTokens: prev.cacheReadTokens + tokens.cacheReadTokens,
-        cacheWriteTokens: prev.cacheWriteTokens + tokens.cacheWriteTokens,
-        turns: prev.turns + 1,
-        model: used.model || prev.model,
-        estimatedCost: prev.estimatedCost + turnCost,
-      }))
+      if (isDeepSeekModel(model)) {
+        const now = await $.clock.now()
+        const tokens: Tokens = {
+          inputTokens: used.input_tokens ?? 0,
+          outputTokens: used.output_tokens ?? 0,
+          cacheReadTokens: used.cache_read_input_tokens ?? 0,
+          cacheWriteTokens: used.cache_creation_input_tokens ?? 0,
+        }
+        const turnCost = costOf(tokens, cfg, peakPricesFor(model, cfg), now)
+
+        await update($, usageAtom, prev => ({
+          ...prev,
+          inputTokens: prev.inputTokens + tokens.inputTokens,
+          outputTokens: prev.outputTokens + tokens.outputTokens,
+          cacheReadTokens: prev.cacheReadTokens + tokens.cacheReadTokens,
+          cacheWriteTokens: prev.cacheWriteTokens + tokens.cacheWriteTokens,
+          turns: prev.turns + 1,
+          estimatedCost: prev.estimatedCost + turnCost,
+        }))
+      }
     }
 
     return next(e)
@@ -494,6 +543,10 @@ export const register: Register = (on, options) => {
     if (e.props.hasSurvey) return next(e)
     if (await read($, hiddenAtom)) return next(e)
 
+    // 新会话默认不出现：只有认出来跑的是 DeepSeek 模型，这条带子才画。
+    // 模型在 session.start 和每一轮里都会更新，所以中途切模型也会跟着变。
+    if (!isDeepSeekModel(await read($, modelAtom))) return next(e)
+
     const { Box, Text, Button } = $.ui.resolve(e)
     const balance = await read($, balanceAtom)
     const usage = await read($, usageAtom)
@@ -514,8 +567,8 @@ export const register: Register = (on, options) => {
       )
     }
 
-    // 本会话估算花费的进度条。它量的是「这一轮已经花了多少」，走满一轮就
-    // 归零重来，所以后面的 ×N 是必要的 —— 光看条本身看不出这是第几轮。
+    // 本会话估算花费的进度条。它量的是当前这一元里已经花了多少，每满 ¥1 就
+    // 归零重来，所以后面的 ×N 是必要的 —— 它就是已经花掉的整元数。
     let cycleNode: RenderElement | null = null
     if (cfg.showCycle) {
       const { percent, completed } = spendCycle(usage.estimatedCost, CYCLE_BUDGET)
