@@ -1,7 +1,7 @@
 {
   "name": "deepseek-cost-hud",
   "displayName": "DeepSeek Cost HUD",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "DeepSeek 余额与用量 HUD —— 同时绘制在 Claude Code 终端与 Claude Desktop 输入框上方",
   "author": {
     "name": "zhenghan3852",
@@ -10,7 +10,7 @@
   "homepage": "https://github.com/zhenghan3852/ccplugin-deepseek-cost",
   "repository": "https://github.com/zhenghan3852/ccplugin-deepseek-cost",
   "license": "MIT",
-  "keywords": ["keywords", "deepseek", "balance", "usage", "cost", "hud", "statusline", "desktop"],
+  "keywords": ["deepseek", "balance", "usage", "cost", "hud", "statusline", "desktop"],
   "types": "./types/index.d.ts",
   "userConfig": {
     "apiKey": {

@@ -331,13 +331,18 @@ async function refreshBalance($: EngineInterface, cfg: Settings): Promise<void> 
   }
 }
 
-/** 读一次当前会话的模型写进状态 —— 横条出不出现、按哪套价算钱都看它。 */
-async function refreshModel($: EngineInterface): Promise<void> {
-  try {
-    const model = await $.session.model()
-    if (model?.trim()) await update($, modelAtom, () => model.trim())
-  } catch {
-    // 拿不到就先当没有；每一轮的 turn.complete 还会再校正一次
+/**
+ * 回放上一次确认过的上游模型（存在 `$.store`，跨会话）。
+ *
+ * **为什么不用 `$.session.model()`**：它给的是映射**前**的客户端模型名 ——
+ * 走 cc-switch 之类网关时拿到的是 `claude-haiku-4-5[1m]` 这种，拿去判断
+ * "是不是 DeepSeek"必然判错。上游真名只有每轮 `turn.complete` 的响应里才有，
+ * 所以这里只回放上次的结论；新机器上第一次跑仍要等第一轮回答完。
+ */
+async function restoreModel($: EngineInterface): Promise<void> {
+  const saved = await $.store.get('lastModel')
+  if (typeof saved === 'string' && saved.trim()) {
+    await update($, modelAtom, () => saved.trim())
   }
 }
 
@@ -353,10 +358,14 @@ async function costReport($: EngineInterface, cfg: Settings): Promise<string> {
     rows.push('余额        尚未取到（用 /deepseek-key 配 Key，或设 DEEPSEEK_API_KEY）')
   }
 
-  // 花费是按模型折算的，所以先把「按哪个模型、哪套价」交代清楚
-  const model = (await read($, modelAtom)) || '未知'
+  // 花费是按模型折算的，所以先把「按哪个模型、哪套价」交代清楚。
+  // 注意要分清"还不知道"和"确认不是 DeepSeek"：前一种是本会话还没走完一轮，
+  // 说成后者就是错的 —— 上游真名只有每轮的响应里才有。
+  const model = await read($, modelAtom)
   const known = MODEL_PRICES[model]
-  if (!isDeepSeekModel(model)) {
+  if (!model) {
+    rows.push('模型        还不知道（本会话还没走完一轮，模型在第一次回答后确定）')
+  } else if (!isDeepSeekModel(model)) {
     rows.push(`模型        ${model}   （非 DeepSeek 模型：不计价，横条也不显示）`)
   } else if (known) {
     rows.push(
@@ -561,9 +570,9 @@ export const register: Register = (on, options) => {
       description: '看抽奖图鉴：各档收集进度与已抽到的物品',
     })
 
-    // 3) 拉一次真实余额（有缓存也拉，让数字尽快变准），再看清用的是哪个模型
+    // 3) 拉一次真实余额（有缓存也拉，让数字尽快变准），再回放上次确认的模型
     await refreshBalance($, cfg)
-    await refreshModel($)
+    await restoreModel($)
 
     // 4) 起定时刷新。定时器归引擎的时钟管，钩子这一趟结束也照样跑，
     //    直到 cancel() 或模块被重载（重载会把上一个环境的定时器一并丢掉，
@@ -603,9 +612,14 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const used = e.usage
     if (used) {
-      // 这一轮是谁在跑：优先用响应里报的模型，没有就退回会话模型
-      const model = (used.model || (await read($, modelAtom))).trim()
-      if (model) await update($, modelAtom, () => model)
+      // 这一轮是谁在跑：优先用响应里报的模型，没有就退回已记下的
+      const known = await read($, modelAtom)
+      const model = (used.model || known).trim()
+      if (model && model !== known) {
+        await update($, modelAtom, () => model)
+        // 记下来，下次开新会话就能立刻判断，不用等第一轮回答
+        await $.store.set('lastModel', model)
+      }
 
       if (isDeepSeekModel(model)) {
         const now = await $.clock.now()

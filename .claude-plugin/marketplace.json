@@ -8,13 +8,13 @@
       "name": "deepseek-cost-hud",
       "source": "./",
       "description": "DeepSeek 余额与用量 HUD —— 同时显示在 Claude Code 终端和 Claude Desktop 上",
-      "version": "0.4.0",
+      "version": "0.4.1",
       "author": {
         "name": "zhenghan3852",
         "url": "https://github.com/zhenghan3852"
       },
       "license": "MIT",
-      "keywords": ["keywords", "deepseek", "balance", "usage", "cost", "hud", "statusline", "desktop", "claude-code"]
+      "keywords": ["deepseek", "balance", "usage", "cost", "hud", "statusline", "desktop", "claude-code"]
     }
   ]
 }

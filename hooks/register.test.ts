@@ -58,12 +58,12 @@ function stubBalance(on: On): void {
  * 引擎自带的接口测试里没人作答，插件用到哪几个就得替哪几个备一个。
  * 横条隐藏时钩子走 next(e)，引擎接着画自己的内容 —— 那条路也要有个替身。
  *
- * `session.model` 决定横条出不出现，所以默认给一个 DeepSeek 模型；要测「非
- * DeepSeek 就整条不画」传别的模型 id 进来。
+ * 插件**不读** `$.session.model()`：它给的是映射前的客户端模型名（走网关时是
+ * `claude-haiku-4-5[1m]` 这种），判断不了"是不是 DeepSeek"。上游真名只从每轮
+ * `turn.complete` 的响应里认，认到后会记进 store 供后续会话回放。
  */
-function stubEngine(on: On, model = 'deepseek-flash'): void {
+function stubEngine(on: On): void {
   on('command.register', () => ({ value: { command: '' } }))
-  on('session.model', () => ({ value: model }))
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['engine drew its own'] }))
 }
 
@@ -71,9 +71,12 @@ function stubEngine(on: On, model = 'deepseek-flash'): void {
 async function startSession($: Engine, on: On, seedStore?: () => void): Promise<MockClock> {
   const clock = mock.clock(on)
   // seedStore 用来换掉内置的 store 替身：`mock.store` 不回显写进去的东西，
-  // 想在抽奖后检查账本，测试得自己拿一个 Map 接住读写
+  // 想在抽奖后检查账本、或想改变"已确认的模型"，测试得自己拿一个 Map 接住读写。
+  //
+  // 默认那份 store 里预置了 lastModel —— 也就是"这台机器已经确认过在跑
+  // DeepSeek"。不给的话横条按设计就不该出现（要等第一轮回答才认出来）。
   if (seedStore) seedStore()
-  else mock.store(on)
+  else mock.store(on, { lastModel: 'deepseek-flash' })
   on('session.start', () => ({ cwd: '/tmp/hud' }))
   await $.session.start({ cwd: '/tmp/hud', surface: 'terminal', isInteractive: true })
   return clock
@@ -234,10 +237,12 @@ test('花费进度条走满一轮就归零，并标出已经走满的轮数', as
 
 test('非 DeepSeek 模型时整条横条都不画，那一轮也不进账', async ($, on) => {
   mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
-  stubEngine(on, 'glm-5.3')
+  stubEngine(on)
   stubBalance(on)
   on('turn.complete', () => ({ text: '' }))
-  await startSession($, on)
+  // 这台机器上次确认的模型是 glm，所以新会话一开就不画横条
+  const store = fakeStore({ lastModel: 'glm-5.3' })
+  await startSession($, on, () => store.stub(on))
 
   // 走完一轮（这一轮报的也是 glm），钩子仍应直接 next(e)，把这条带子让给引擎
   await $.turn.complete({ ...TURN, usage: { ...TURN.usage, model: 'glm-5.3' } })
@@ -443,4 +448,30 @@ test('每走完一轮就多一次抽奖机会，次数记在全局账本上', as
 
   const record = store.saved.get('gacha') as { spent: number }
   expect(Math.round(record.spent * 100) / 100).toBe(1.05)
+})
+
+test('模型在第一次回答后才认出来，并记进 store 供后续会话回放', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
+  stubBalance(on)
+  on('turn.complete', () => ({ text: '' }))
+  // 空账本 = 这台机器还没确认过在跑什么模型
+  const store = fakeStore()
+  await startSession($, on, () => store.stub(on))
+
+  // 第一轮之前：还不知道，横条按设计不出现（这正是 cc-switch 场景下的初态）
+  const band = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: BAND_PROPS,
+  })
+  expect(await band.find({ text: /DeepSeek/ })).toBeUndefined()
+
+  // 走完一轮：响应报的是上游真名，认出来并记下
+  await $.turn.complete(TURN)
+  expect(store.saved.get('lastModel')).toBe('deepseek-flash')
+
+  await band.redraw()
+  expect(await band.find({ text: '¥40.36' })).toBeDefined()
 })
