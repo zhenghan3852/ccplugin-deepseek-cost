@@ -44,8 +44,8 @@ import type {
 } from 'claude-code'
 
 import type { Balance, GachaRecord, HudError, Spin, TierId, Usage } from '../types'
-import { ITEM_BY_ID, ITEMS, ITEMS_BY_TIER, rollItem, TIER_BY_ID, TIERS } from './gacha-items'
-import { encodeRow, wheelGrid, WHEEL_FRAMES, WHEEL_TICK_MS } from './gacha-wheel'
+import { ITEM_BY_ID, ITEMS, ITEMS_BY_TIER, rollDraw, TIER_BY_ID, TIERS } from './gacha-items'
+import { encodeRow, wheelGrid, WHEEL_FRAMES, WHEEL_SIZE, WHEEL_TICK_MS } from './gacha-wheel'
 
 // ── 状态引用 ────────────────────────────────────────────────────────
 // plugin / key 必须是源码里的字面量，`claude plugin validate` 会把它们
@@ -407,7 +407,15 @@ async function costReport($: EngineInterface, cfg: Settings): Promise<string> {
 // 次数与图鉴存在 `$.store` 里，所以跨会话共享 —— 任意会话里花掉的 token 攒下
 // 的次数，都能在任意会话里抽。开奖的**过程**状态才放 `$.state`。
 
-const EMPTY_SPIN: Spin = { phase: 'idle', tier: null, itemId: null, frame: 0, pending: 0 }
+const EMPTY_SPIN: Spin = {
+  phase: 'idle',
+  slots: [],
+  winner: 0,
+  tier: null,
+  itemId: null,
+  frame: 0,
+  pending: 0,
+}
 
 const spinAtom = atom({ plugin: 'deepseek-cost-hud', key: 'spin' } as const, EMPTY_SPIN)
 
@@ -561,22 +569,24 @@ async function startDraw($: EngineInterface): Promise<string> {
     return `还没有可抽的次数：累计花费 ¥${record.spent.toFixed(2)}，每满 ¥1 得一次。`
   }
 
-  const { tier, item } = rollItem(Math.random)
+  const draw = rollDraw(Math.random)
   await $.store.set('gacha', {
     spent: record.spent,
     drawn: record.drawn + 1,
-    owned: { ...record.owned, [item.id]: (record.owned[item.id] ?? 0) + 1 },
+    owned: { ...record.owned, [draw.item.id]: (record.owned[draw.item.id] ?? 0) + 1 },
   })
 
   await update($, spinAtom, () => ({
     phase: 'spinning' as const,
-    tier,
-    itemId: item.id,
+    slots: [...draw.slots],
+    winner: draw.winner,
+    tier: draw.tier,
+    itemId: draw.item.id,
     frame: 0,
     pending: pending - 1,
   }))
 
-  const headline = `${TIER_BY_ID[tier].name} · ${item.name}`
+  const headline = `${TIER_BY_ID[draw.tier].name} · ${draw.item.name}`
   // columns / rows 都是"请求"：docked 时按 columns 开宽，inline 时按 rows 开高。
   // 转盘本身 11 格宽，加上结果行和按钮，给 30 列才不至于挤成一团。
   const opened = await $.ui.open({
@@ -877,22 +887,32 @@ export const register: Register = (on, options) => {
     const item = spin.itemId ? ITEM_BY_ID[spin.itemId] : undefined
     const revealed = spin.phase === 'revealed'
 
-    const wheel = wheelGrid(spin.tier, revealed ? WHEEL_FRAMES - 1 : spin.frame).map((cells, y) => (
-      <Box key={`row${y}`} flexDirection="row">
-        {encodeRow(cells).map((run, x) =>
-          run.color === null ? (
-            <Text key={`cell${x}`}>{cellFill(surface, run.width)}</Text>
-          ) : (
-            <Text key={`cell${x}`} backgroundColor={run.color}>
-              {cellFill(surface, run.width)}
-            </Text>
-          ),
-        )}
-      </Box>
-    ))
+    // 指针画在轮盘正上方：不画的话看不出"停在哪一块"是看顶部那格
+    const pointer = (
+      <Text key="pointer" color="claude">
+        {cellFill(surface, (WHEEL_SIZE - 1) / 2)}▼
+      </Text>
+    )
+    const wheel = wheelGrid(spin.slots, spin.winner, revealed ? WHEEL_FRAMES - 1 : spin.frame).map(
+      (cells, y) => (
+        <Box key={`row${y}`} flexDirection="row">
+          {encodeRow(cells).map((run, x) => {
+            const color = run.tier === null ? null : TIER_BY_ID[run.tier].color
+            return color === null ? (
+              <Text key={`cell${x}`}>{cellFill(surface, run.width)}</Text>
+            ) : (
+              <Text key={`cell${x}`} backgroundColor={color}>
+                {cellFill(surface, run.width)}
+              </Text>
+            )
+          })}
+        </Box>
+      ),
+    )
 
     return (
       <Box flexDirection="column">
+        {pointer}
         {wheel}
         {revealed && item ? (
           <Box flexDirection="row" gap={1}>

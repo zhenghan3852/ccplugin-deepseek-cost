@@ -173,26 +173,54 @@ function groupByTier(items: readonly Item[]): Record<TierId, readonly Item[]> {
 /** 每档的物品池，抽奖时按档取用。 */
 export const ITEMS_BY_TIER = groupByTier(ITEMS)
 
+/** 转盘上的色块数量。 */
+export const WHEEL_SLOTS = 6
+
 /**
- * 抽一次。随机源注入，所以能确定性地单测。
- *
- * 两次取值：先按档位概率定档，再在该档里等概率取一件。调用方要保证 `rand`
- * 返回 [0, 1) —— 传 `Math.random`，或测试里传一个固定序列。
+ * 按档位概率定一档。两次取值里的第一步，抽奖时每个色块都要走一遍。
+ * `rand` 必须返回 [0, 1)。
  */
-export function rollItem(rand: () => number): { tier: TierId; item: Item } {
+export function pickTier(rand: () => number): TierId {
   const roll = rand()
   let cumulative = 0
-  let tier: TierId = TIERS[TIERS.length - 1]!.id
   for (const candidate of TIERS) {
     cumulative += candidate.chance
-    if (roll < cumulative) {
-      tier = candidate.id
-      break
-    }
+    if (roll < cumulative) return candidate.id
   }
+  // 浮点求和可能差最后一点点，落到这里就是最后一档
+  return TIERS[TIERS.length - 1]!.id
+}
 
+export type Draw = {
+  /** 转盘上六个色块各是什么档位 —— 每次抽奖重新生成 */
+  slots: readonly TierId[]
+  /** 指针落在第几个色块（0 起） */
+  winner: number
+  /** 中奖色块的档位 */
+  tier: TierId
+  /** 最终抽到的物品 */
+  item: Item
+}
+
+/**
+ * 抽一次。
+ *
+ * 机制是三段，和转盘上看到的完全一致：
+ *   1. 按档位概率生成 6 个色块 —— 所以大概率整盘都是普通（蓝）
+ *   2. 指针在 6 个色块上**等概率**落点，落到哪块就取哪块
+ *   3. 从该档的物品里等概率取一件
+ *
+ * 有效概率正好等于档位概率：P(中 t 档) = Σᵢ (1/6)·P(第 i 块是 t 档) = p_t。
+ * 所以"看起来大概率是蓝的"和"实际大概率抽到普通"是同一件事 —— 转盘不撒谎。
+ *
+ * 随机源注入，能确定性地单测。
+ */
+export function rollDraw(rand: () => number): Draw {
+  const slots = Array.from({ length: WHEEL_SLOTS }, () => pickTier(rand))
+  const winner = Math.min(WHEEL_SLOTS - 1, Math.floor(rand() * WHEEL_SLOTS))
+  const tier = slots[winner]!
   const pool = ITEMS_BY_TIER[tier]
   const index = Math.min(pool.length - 1, Math.floor(rand() * pool.length))
   // pool 非空由物品表本身保证（测试里也断言了各档件数）
-  return { tier, item: pool[index]! }
+  return { slots, winner, tier, item: pool[index]! }
 }

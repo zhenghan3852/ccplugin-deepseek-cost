@@ -16,8 +16,15 @@ import type { On } from 'claude-code'
 import type { Engine, MockClock } from 'claude-code/testing'
 import { expect, mock, test } from 'claude-code/testing'
 
-import { ITEMS, ITEMS_BY_TIER, rollItem, TIERS } from './gacha-items'
-import { finalRotation, wheelGrid, WHEEL_FRAMES, WHEEL_SIZE, WHEEL_TICK_MS } from './gacha-wheel'
+import { ITEMS, ITEMS_BY_TIER, rollDraw, TIERS, WHEEL_SLOTS } from './gacha-items'
+import {
+  finalRotation,
+  slotAtPointer,
+  wheelGrid,
+  WHEEL_FRAMES,
+  WHEEL_SIZE,
+  WHEEL_TICK_MS,
+} from './gacha-wheel'
 
 const PLUGIN = 'deepseek-cost-hud'
 const GACHA_PANE = 'deepseek-gacha'
@@ -292,39 +299,57 @@ test('物品表：5 档 100 件，概率之和为 1', () => {
   expect(Math.round(TIERS.reduce((acc, t) => acc + t.chance, 0) * 1e6)).toBe(1_000_000)
 })
 
-test('rollItem：先按档位概率定档，再在档内等概率取件', () => {
-  // 第二次取值固定在 0，拿到的总是该档第一件
-  const tierAt = (roll: number) => rollItem(sequence([roll, 0])).tier
+test('rollDraw：按概率生成六个色块，指针在六块上等概率落点', () => {
+  // 随机源恒为 0 → 每块都取到概率最高的普通档，指针落第 0 块
+  const allCommon = rollDraw(() => 0)
+  expect(allCommon.slots).toEqual(Array(WHEEL_SLOTS).fill('common'))
+  expect(allCommon.winner).toBe(0)
+  expect(allCommon.tier).toBe('common')
 
-  expect(tierAt(0)).toBe('common')
-  expect(tierAt(0.85)).toBe('rare') // 累加区间 0.79923 ~ 0.95908
-  expect(tierAt(0.99)).toBe('uncommon') // 0.95908 ~ 0.99105
-  expect(tierAt(0.995)).toBe('epic') // 0.99105 ~ 0.99744
-  expect(tierAt(0.999)).toBe('legendary') // 0.99744 ~ 1
+  // 指针落点是均匀的：0.99 落在最后一块
+  const lastSlot = rollDraw(sequence([0, 0, 0, 0, 0, 0, 0.99, 0]))
+  expect(lastSlot.winner).toBe(WHEEL_SLOTS - 1)
+  expect(lastSlot.tier).toBe('common')
 
-  // 档内均匀：0 拿第一件，接近 1 拿最后一件
+  // 中奖档位就是指针停下的那一块 —— 不是另外算出来的
+  const mixed = rollDraw(sequence([0, 0.999, 0, 0, 0, 0, 0.3, 0]))
+  expect(mixed.slots[1]).toBe('legendary')
+  expect(mixed.winner).toBe(1)
+  expect(mixed.tier).toBe('legendary')
+
+  // 档内均匀：指针落第 0 块（普通）时，rand 0 取第一件、0.9999 取最后一件
   const common = ITEMS_BY_TIER.common
-  expect(rollItem(sequence([0, 0])).item).toEqual(common[0])
-  expect(rollItem(sequence([0, 0.9999])).item).toEqual(common[common.length - 1])
+  expect(rollDraw(sequence([0, 0, 0, 0, 0, 0, 0, 0])).item).toEqual(common[0])
+  expect(rollDraw(sequence([0, 0, 0, 0, 0, 0, 0, 0.9999])).item).toEqual(
+    common[common.length - 1],
+  )
 })
 
-test('终帧的指针一定停在抽中的那一档上', () => {
-  // 指针在正上方 = 第 0 行、正中那一列。这是整个动画的核心不变量：
-  // 结果先定、角度反推，所以转盘停下的位置永远是真实结果。
-  const middle = (WHEEL_SIZE - 1) / 2
-  for (const tier of TIERS) {
-    expect(wheelGrid(tier.id, WHEEL_FRAMES - 1)[0]?.[middle]).toBe(tier.color)
+test('终帧的指针一定停在中奖那一块上', () => {
+  // 结果先定、角度反推 —— 这是整个动画的核心不变量
+  for (let slot = 0; slot < WHEEL_SLOTS; slot++) {
+    expect(slotAtPointer(finalRotation(slot))).toBe(slot)
   }
 })
 
-test('转盘是个圆环：中心和四角留空，环上有颜色', () => {
-  const grid = wheelGrid('common', 0)
+test('终帧盘面上，指针那一格就是中奖块的档位', () => {
+  const slots = ['common', 'rare', 'uncommon', 'epic', 'legendary', 'common'] as const
+  const middle = (WHEEL_SIZE - 1) / 2
+  for (let slot = 0; slot < WHEEL_SLOTS; slot++) {
+    // 指针在正上方 = 第 0 行、正中那一列
+    expect(wheelGrid(slots, slot, WHEEL_FRAMES - 1)[0]?.[middle]).toBe(slots[slot])
+  }
+})
+
+test('转盘是个圆环：中心和四角留空，环上有档位', () => {
+  const slots = ['common', 'rare', 'uncommon', 'epic', 'legendary', 'common'] as const
+  const grid = wheelGrid(slots, 0, 0)
   const middle = (WHEEL_SIZE - 1) / 2
   expect(grid[middle]?.[middle]).toBeNull()
   expect(grid[0]?.[0]).toBeNull()
   expect(grid[0]?.[middle]).not.toBeNull()
-  // 转起来了：同一档不同帧画面不该一样
-  expect(wheelGrid('common', 20)).not.toEqual(wheelGrid('common', 0))
+  // 转起来了：同一盘不同帧画面不该一样
+  expect(wheelGrid(slots, 0, 20)).not.toEqual(wheelGrid(slots, 0, 0))
 })
 
 test('抽奖：扣一次次数、记进图鉴、开出面板', async ($, on) => {

@@ -77,7 +77,14 @@ export type GachaRecord = {
  */
 export type Spin = {
   phase: 'idle' | 'spinning' | 'revealed'
-  /** 本次抽到的档位 */
+  /**
+   * 这次抽奖在转盘上生成的六个色块各是什么档位。**按概率生成**，所以大概率
+   * 一片普通（蓝）；指针在六块上等概率落点，落在哪块就取哪块。
+   */
+  slots: TierId[]
+  /** 指针落在第几块（0 起） */
+  winner: number
+  /** 本次抽到的档位（= slots[winner]） */
   tier: TierId | null
   /** 本次抽到的物品 id */
   itemId: string | null
