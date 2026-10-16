@@ -50,21 +50,12 @@ function stubBalance(on: On): void {
   }))
 }
 
-/** 会话用量：横条上的上下文进度条取自这里。 */
-const SESSION_USAGE = {
-  startedAt: 0,
-  context: { tokens: 120_000, window: 1_000_000, percent: 12 },
-  rateLimits: [],
-}
-
 /**
  * 引擎自带的接口测试里没人作答，插件用到哪几个就得替哪几个备一个。
  * 横条隐藏时钩子走 next(e)，引擎接着画自己的内容 —— 那条路也要有个替身。
  */
 function stubEngine(on: On): void {
   on('command.register', () => ({ value: { command: '' } }))
-  on('ui.status', () => ({ value: undefined }))
-  on('session.usage', () => ({ value: SESSION_USAGE }))
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['engine drew its own'] }))
 }
 
@@ -167,4 +158,28 @@ test('没有 Key 时不画余额，只给一个可读的提示', async ($, on) =
   })
 
   expect(await ui.find({ text: '未配置 Key' })).toBeDefined()
+})
+
+test('花费进度条走满一轮就归零，并标出已经走满的轮数', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
+  stubBalance(on)
+  on('turn.complete', () => ({ text: '' }))
+  await startSession($, on)
+
+  // 时钟从 0 起步（1970-01-01 周四 00:00 UTC），按错峰算，单价是高峰价的一半：
+  // 2 亿输出 token × $1.20/M × 50% = $120 —— 走满一轮后余下 $20，即 20%。
+  await $.turn.complete({ ...TURN, usage: { ...TURN.usage, output_tokens: 200_000_000 } })
+
+  const ui = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: BAND_PROPS,
+  })
+
+  // find 不认 key（键不在挂载出来的 props 里），所以按文本断言整条横条
+  const band = await ui.find({ text: /×1/ })
+  expect(band?.text).toMatch(/20\.0%/)
+  expect(band?.text).toMatch(/\$100 ×1/)
 })

@@ -31,10 +31,10 @@
       "description": "横条上是否显示 DeepSeek 账户余额。",
       "default": true
     },
-    "showContext": {
+    "showCycle": {
       "type": "boolean",
-      "title": "显示上下文占用",
-      "description": "横条上是否显示上下文窗口占用进度条与窗口大小。",
+      "title": "显示花费进度条",
+      "description": "横条上是否显示本会话估算花费的进度条，每满 100 归零重来。",
       "default": true
     },
     "showUsage": {

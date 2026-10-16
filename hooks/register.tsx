@@ -10,8 +10,8 @@
  * 画在哪里：
  *   `ui.render` 钩在 `AbovePrompt` 上。这个组件按引擎的说明「只在 terminal 和
  *   desktop 两个 surface 上渲染」，正是跨端所需的那一个：终端里它落在输入框上方，
- *   Desktop 里落成同一位置的横条。另外用 `$.ui.status` 顶一条单行摘要，这样
- *   终端里把横条折叠掉（ctrl+x ctrl+a）之后余额仍然看得见。
+ *   Desktop 里落成同一位置的横条。整条 HUD 只画在这一处 —— 不再往状态行
+ *   （`$.ui.status`）顶单行摘要，因为 Desktop 里那会在输入框下面再冒出一行。
  *
  * 数据从哪来 —— 这几件事的确定性不一样，别混为一谈：
  *
@@ -70,7 +70,7 @@ type Settings = {
   apiKey: string
   apiBase: string
   refreshMs: number
-  showContext: boolean
+  showCycle: boolean
   showUsage: boolean
   showBalance: boolean
   showEstimate: boolean
@@ -102,7 +102,7 @@ function readSettings(options: PluginOptions): Settings {
     apiKey: asString(options?.apiKey),
     apiBase: asString(options?.balanceApiBase, 'https://api.deepseek.com').replace(/\/+$/, ''),
     refreshMs: Math.max(5, asNumber(options?.refreshSeconds, 60)) * 1000,
-    showContext: asBoolean(options?.showContext, true),
+    showCycle: asBoolean(options?.showCycle, true),
     showUsage: asBoolean(options?.showUsage, true),
     showBalance: asBoolean(options?.showBalance, true),
     showEstimate: asBoolean(options?.showEstimate, true),
@@ -188,19 +188,24 @@ function compact(n: number): string {
 }
 
 /** 10 格进度条 */
-function renderBar(percent: number | null, width = 10): string {
-  if (percent === null) return '▬'.repeat(width)
+function renderBar(percent: number, width = 10): string {
   const p = Math.max(0, Math.min(100, percent))
   const filled = Math.round((p / 100) * width)
   return '█'.repeat(filled) + '░'.repeat(width - filled)
 }
 
-/** 上下文用得越满，颜色越烫 */
-function contextLevel(percent: number | null): 'success' | 'warning' | 'error' {
-  if (percent === null) return 'success'
-  if (percent >= 85) return 'error'
-  if (percent >= 70) return 'warning'
-  return 'success'
+/** 进度条每走满这么多就归零重来，单位与 priceCurrency 一致。 */
+const CYCLE_BUDGET = 100
+
+/**
+ * 本会话估算花费在**当前这一轮**里的位置。
+ * `completed` 是已经走满的轮数，横条上以 ×N 标出来 —— 因为进度条本身
+ * 每满一轮就重置，不标的话看不出这是第几轮。
+ */
+function spendCycle(cost: number, budget: number): { percent: number; completed: number } {
+  if (!(budget > 0)) return { percent: 0, completed: 0 }
+  const completed = Math.floor(cost / budget)
+  return { percent: ((cost - completed * budget) / budget) * 100, completed }
 }
 
 /** 余额越低越危险 */
@@ -338,41 +343,6 @@ async function refreshBalance($: EngineInterface, cfg: Settings): Promise<void> 
   }
 }
 
-/** 顶一条单行摘要到状态行 —— 终端里横条被折叠时靠它兜底。 */
-async function paintStatus($: EngineInterface, cfg: Settings): Promise<void> {
-  if (await read($, hiddenAtom)) {
-    $.ui.status(undefined)
-    return
-  }
-
-  const parts: string[] = []
-  const balance = await read($, balanceAtom)
-
-  if (cfg.showBalance) {
-    const error = await read($, errorAtom)
-    if (balance) {
-      parts.push(`DeepSeek ${money(balance.total, currencySymbol(balance.currency))}`)
-    } else if (error) {
-      parts.push(`DeepSeek ${shortError(error)}`)
-    }
-  }
-
-  if (cfg.showUsage) {
-    const usage = await read($, usageAtom)
-    if (usage.turns > 0) {
-      parts.push(`↑${compact(usage.inputTokens)} ↓${compact(usage.outputTokens)}`)
-      const spent = measuredSpend(usage, balance)
-      if (spent) {
-        parts.push(`实测${money(spent.amount, currencySymbol(spent.currency))}`)
-      } else {
-        parts.push(`≈${money(usage.estimatedCost, cfg.priceSymbol)}`)
-      }
-    }
-  }
-
-  $.ui.status(parts.length > 0 ? parts.join('  ·  ') : undefined)
-}
-
 /** `/deepseek-cost` 的完整报告 —— 实测和估算摆在一起看偏差。 */
 async function costReport($: EngineInterface, cfg: Settings): Promise<string> {
   const balance = await read($, balanceAtom)
@@ -463,14 +433,13 @@ export const register: Register = (on, options) => {
 
     // 3) 拉一次真实余额（有缓存也拉，让数字尽快变准），顺带立下实测基准
     await refreshBalance($, cfg)
-    await paintStatus($, cfg)
 
     // 4) 起定时刷新。定时器归引擎的时钟管，钩子这一趟结束也照样跑，
     //    直到 cancel() 或模块被重载（重载会把上一个环境的定时器一并丢掉，
     //    所以这里 cancel 只是防御性的）。
     timer?.cancel()
     timer = $.clock.every(cfg.refreshMs, () => {
-      void refreshBalance($, cfg).then(() => paintStatus($, cfg))
+      void refreshBalance($, cfg)
     })
 
     return next(e)
@@ -483,7 +452,6 @@ export const register: Register = (on, options) => {
   on('session.end', async ($, e, next) => {
     timer?.cancel()
     timer = null
-    $.ui.status(undefined)
 
     // 这三种意味着接下来是一条新对话，本会话的用量不该带过去
     if (e.reason === 'clear' || e.reason === 'resume' || e.reason === 'logout') {
@@ -524,7 +492,6 @@ export const register: Register = (on, options) => {
       }))
     }
 
-    await paintStatus($, cfg)
     return next(e)
   })
 
@@ -533,7 +500,6 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'deepseek-hud' }, async ($, e) => {
     const hidden = await read($, hiddenAtom)
     await update($, hiddenAtom, () => !hidden)
-    await paintStatus($, cfg)
     return { text: hidden ? 'DeepSeek HUD 已显示。' : 'DeepSeek HUD 已隐藏。' }
   })
 
@@ -541,7 +507,6 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'deepseek-refresh' }, async ($, e) => {
     await refreshBalance($, cfg)
-    await paintStatus($, cfg)
     const error = await read($, errorAtom)
     const balance = await read($, balanceAtom)
     if (error) return { text: `刷新失败：${shortError(error)}` }
@@ -558,7 +523,6 @@ export const register: Register = (on, options) => {
     }
     await $.store.set('apiKey', key)
     await refreshBalance($, cfg)
-    await paintStatus($, cfg)
     const error = await read($, errorAtom)
     return { text: error ? `Key 已保存，但刷新失败：${shortError(error)}` : 'Key 已保存，余额已刷新。' }
   })
@@ -576,7 +540,6 @@ export const register: Register = (on, options) => {
     const balance = await read($, balanceAtom)
     const usage = await read($, usageAtom)
     const error = await read($, errorAtom)
-    const session = await $.session.usage()
 
     // 余额
     let balanceNode: RenderElement | null = null
@@ -593,17 +556,20 @@ export const register: Register = (on, options) => {
       )
     }
 
-    // 上下文占用
-    let contextNode: RenderElement | null = null
-    if (cfg.showContext) {
-      const percent = session.context.percent ?? null
-      const window = session.context.window
-      const size =
-        window >= 1_000_000 ? `${Math.round(window / 1_000_000)}M` : `${Math.round(window / 1_000)}K`
-      contextNode = (
-        <Text key="context" color={contextLevel(percent)}>
-          {renderBar(percent)} {percent === null ? '--' : `${Math.round(percent)}%`}
-          <Text dimColor> {size}</Text>
+    // 本会话估算花费的进度条。它量的是「这一轮已经花了多少」，走满一轮就
+    // 归零重来，所以后面的 ×N 是必要的 —— 光看条本身看不出这是第几轮。
+    let cycleNode: RenderElement | null = null
+    if (cfg.showCycle) {
+      const { percent, completed } = spendCycle(usage.estimatedCost, CYCLE_BUDGET)
+      cycleNode = (
+        <Text key="cycle">
+          {renderBar(percent)} {percent.toFixed(1)}%
+          <Text dimColor>
+            {' '}
+            {cfg.priceSymbol}
+            {CYCLE_BUDGET}
+            {completed > 0 ? ` ×${completed}` : ''}
+          </Text>
         </Text>
       )
     }
@@ -630,7 +596,7 @@ export const register: Register = (on, options) => {
     }
 
     // 只在实际画出来的片段之间插分隔符，免得隐藏一栏后留下孤零零的 ·
-    const pieces = [balanceNode, contextNode, usageNode].filter(
+    const pieces = [balanceNode, cycleNode, usageNode].filter(
       (node): node is RenderElement => node !== null,
     )
     const children: RenderNode[] = pieces.flatMap((node, index) =>
