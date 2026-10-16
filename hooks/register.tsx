@@ -267,19 +267,19 @@ let timer: { cancel: () => void } | null = null
 let isFetching = false
 
 /**
- * 按优先级找 API Key：
- * 插件配置 → 插件自带存储（/deepseek-key 存的） → DEEPSEEK_API_KEY → ANTHROPIC_AUTH_TOKEN
+ * 按优先级找 API Key：插件配置 → `DEEPSEEK_API_KEY` → `ANTHROPIC_AUTH_TOKEN`。
+ *
+ * 只有配置项那一条会把值存进系统凭据库 —— 另两条是环境变量回退，值本来就在
+ * 环境里。所以**推荐用配置项**：它不像早期那样在磁盘上留一份明文。
  */
 async function resolveKey($: EngineInterface, cfg: Settings): Promise<string> {
   if (cfg.apiKey) return cfg.apiKey
 
-  const stored = await $.store.get('apiKey')
-  if (typeof stored === 'string' && stored.trim()) return stored.trim()
-
   const direct = await $.env.get('DEEPSEEK_API_KEY')
   if (direct?.trim()) return direct.trim()
 
-  // 用 cc-switch 之类把 Claude Code 路由到 DeepSeek 时，key 落在 ANTHROPIC_AUTH_TOKEN
+  // 用 cc-switch 之类把 Claude Code 路由到 DeepSeek 时，key 会落在这里。
+  // 注意：代理模式下这里是代理令牌（ccs-...）而不是真 key，打官方接口会 401。
   const routed = await $.env.get('ANTHROPIC_AUTH_TOKEN')
   if (routed?.trim()) return routed.trim()
 
@@ -355,7 +355,7 @@ async function costReport($: EngineInterface, cfg: Settings): Promise<string> {
   if (balance) {
     rows.push(`余额        ${money(balance.total, currencySymbol(balance.currency))}（充值 ${balance.toppedUp.toFixed(2)} + 赠送 ${balance.granted.toFixed(2)}）`)
   } else {
-    rows.push('余额        尚未取到（用 /deepseek-key 配 Key，或设 DEEPSEEK_API_KEY）')
+    rows.push('余额        尚未取到（Key 没配上：用 /plugin 的 Configure options 填，或设 DEEPSEEK_API_KEY）')
   }
 
   // 花费是按模型折算的，所以先把「按哪个模型、哪套价」交代清楚。
@@ -557,11 +557,6 @@ export const register: Register = (on, options) => {
       description: '立刻刷新 DeepSeek 余额',
     })
     await $.command.register({
-      name: 'deepseek-key',
-      description: '保存 DeepSeek API Key（存进插件存储）',
-      argumentHint: 'sk-...',
-    })
-    await $.command.register({
       name: 'deepseek-draw',
       description: '用攒下的次数抽一次奖（每花满 ¥1 得一次）',
     })
@@ -668,19 +663,6 @@ export const register: Register = (on, options) => {
     if (error) return { text: `刷新失败：${shortError(error)}` }
     if (!balance) return { text: '还没有余额数据。' }
     return { text: `余额 ${money(balance.total, currencySymbol(balance.currency))}` }
-  })
-
-  on('command.run', { command: 'deepseek-key' }, async ($, e) => {
-    const key = e.args.trim()
-    if (!key) {
-      return {
-        text: '用法：/deepseek-key sk-xxxxxxxx\n（把 Key 存进插件存储；也可以改用环境变量 DEEPSEEK_API_KEY）',
-      }
-    }
-    await $.store.set('apiKey', key)
-    await refreshBalance($, cfg)
-    const error = await read($, errorAtom)
-    return { text: error ? `Key 已保存，但刷新失败：${shortError(error)}` : 'Key 已保存，余额已刷新。' }
   })
 
   // ── 抽奖 ──────────────────────────────────────────────────────────

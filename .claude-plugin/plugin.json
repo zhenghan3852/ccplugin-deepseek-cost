@@ -1,7 +1,7 @@
 {
   "name": "deepseek-cost-hud",
   "displayName": "DeepSeek Cost HUD",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "DeepSeek 余额与用量 HUD —— 同时绘制在 Claude Code 终端与 Claude Desktop 输入框上方",
   "author": {
     "name": "zhenghan3852",
@@ -16,7 +16,7 @@
     "apiKey": {
       "type": "string",
       "title": "DeepSeek API Key",
-      "description": "留空时依次回退到插件存储、DEEPSEEK_API_KEY、ANTHROPIC_AUTH_TOKEN。",
+      "description": "标了 sensitive，填在这里的值会存进系统凭据库（macOS 钥匙串），不会写进 settings.json、也不会进会话记录。留空时依次回退到 DEEPSEEK_API_KEY、ANTHROPIC_AUTH_TOKEN。",
       "sensitive": true
     },
     "refreshSeconds": {

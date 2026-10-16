@@ -116,20 +116,27 @@ claude --plugin-dir .
 
 ## 配置 API Key
 
-四种来源，按优先级：
+**只推荐一种：填插件配置项。** 这个字段在清单里标了 `sensitive`，所以值是进**系统凭据库**（macOS 钥匙串）的 —— 既不写进 `settings.json`，也不会出现在会话记录里。
 
-1. 插件配置（`/plugin` 里填，或 `/config` 里改）
-2. `/deepseek-key sk-xxxx` —— 存进插件自己的存储
-3. 环境变量 `DEEPSEEK_API_KEY`
-4. 环境变量 `ANTHROPIC_AUTH_TOKEN`
+| 你在哪用 | 怎么填 |
+|---|---|
+| 终端 | 会话里 `/plugin configure deepseek-cost-hud`，或 `/plugin` → **Installed** 标签 → 选中插件 → **Configure options** |
+| 桌面端 | 输入框旁的 **+** → **Plugins** → **Manage plugins** → 选中插件 → **Configure options** |
+| 不想开界面 | shell 里 `claude plugin configure deepseek-cost-hud --values-stdin`，stdin 传一个 JSON（如 `{"apiKey":"sk-..."}`） |
 
-> ⚠️ 第 4 条只在 `ANTHROPIC_AUTH_TOKEN` 里放的是**真的 DeepSeek API Key** 时才有用。用 cc-switch 之类的工具走**代理模式**时，那里放的是本地代理令牌（形如 `ccs-...`），拿去打官方接口只会得到 401 —— 这种情况下请用前三种方式之一。
+> `/config` 面板里看不到这个字段 —— 引擎把敏感选项从 `/config` 里排除了，只有上表那几条路。
 
-最省事的是第 3 种：
+填不了界面时的两条环境变量回退，按优先级：
+
+2. `DEEPSEEK_API_KEY` —— 最省事的无界面方案：
 
 ```bash
 export DEEPSEEK_API_KEY="sk-xxxxxxxxxxxxxxxx"
 ```
+
+3. `ANTHROPIC_AUTH_TOKEN` —— ⚠️ 只在里面放的是**真的 DeepSeek API Key** 时才有用。用 cc-switch 之类的工具走**代理模式**时，那里放的是本地代理令牌（形如 `ccs-...`），拿去打官方接口只会得到 401。
+
+> **为什么去掉了 `/deepseek-key`**：它把 key 明文写进插件自己的 store JSON，还会因为你把 key 敲在提示符里而**留在会话记录（transcript）中**。统一走配置项后，key 只进系统凭据库。
 
 ---
 
@@ -140,7 +147,6 @@ export DEEPSEEK_API_KEY="sk-xxxxxxxxxxxxxxxx"
 | `/deepseek-cost` | 本会话用量明细与估算花费，含进度条位置 |
 | `/deepseek-hud` | 显示 / 隐藏横条 |
 | `/deepseek-refresh` | 立刻刷新余额 |
-| `/deepseek-key [sk-...]` | 保存 API Key |
 | `/deepseek-draw` | 用攒下的次数抽一次奖（像素转盘） |
 | `/deepseek-dex` | 看抽奖图鉴：各档收集进度与已抽到的物品 |
 
