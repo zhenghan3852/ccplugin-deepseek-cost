@@ -1,0 +1,87 @@
+{
+  "name": "deepseek-cost-hud",
+  "displayName": "DeepSeek Cost HUD",
+  "version": "0.1.0",
+  "description": "DeepSeek 余额与用量 HUD —— 同时绘制在 Claude Code 终端与 Claude Desktop 输入框上方",
+  "author": {
+    "name": "zhenghan3852",
+    "url": "https://github.com/zhenghan3852"
+  },
+  "homepage": "https://github.com/zhenghan3852/ccplugin-deepseek-cost",
+  "repository": "https://github.com/zhenghan3852/ccplugin-deepseek-cost",
+  "license": "MIT",
+  "keywords": ["deepseek", "balance", "usage", "cost", "hud", "statusline", "desktop"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "apiKey": {
+      "type": "string",
+      "title": "DeepSeek API Key",
+      "description": "留空时依次回退到插件存储、DEEPSEEK_API_KEY、ANTHROPIC_AUTH_TOKEN。",
+      "sensitive": true
+    },
+    "refreshSeconds": {
+      "type": "number",
+      "title": "余额刷新间隔（秒）",
+      "description": "会话进行中按此间隔刷新余额。默认 60。",
+      "default": 60
+    },
+    "showContext": {
+      "type": "boolean",
+      "title": "显示上下文占用进度条",
+      "default": true
+    },
+    "showUsage": {
+      "type": "boolean",
+      "title": "显示本会话 token 用量与花费",
+      "default": true
+    },
+    "showBalance": {
+      "type": "boolean",
+      "title": "显示 DeepSeek 账户余额",
+      "default": true
+    },
+    "showEstimate": {
+      "type": "boolean",
+      "title": "在实测消耗旁并列显示估算值",
+      "description": "实测值来自余额差额，估算值按单价折算。并列显示可以直观看出估算准不准。",
+      "default": true
+    },
+    "balanceApiBase": {
+      "type": "string",
+      "title": "余额 API 地址",
+      "description": "默认 https://api.deepseek.com ，指向官方 /user/balance。",
+      "default": "https://api.deepseek.com"
+    },
+    "priceCurrency": {
+      "type": "string",
+      "title": "单价与估算花费的货币",
+      "description": "只影响估算值；余额一栏永远用接口返回的币种。",
+      "default": "USD",
+      "options": ["USD", "CNY"]
+    },
+    "priceInput": {
+      "type": "number",
+      "title": "输入价 / 百万 token，缓存未命中，高峰价",
+      "description": "默认 0.30 = DeepSeek 官方 deepseek-flash 高峰价（美元）。用 v4-pro 请改成 1.32。",
+      "default": 0.3
+    },
+    "priceCacheRead": {
+      "type": "number",
+      "title": "输入价 / 百万 token，缓存命中，高峰价",
+      "description": "默认 0.006 = deepseek-flash 高峰价。用 v4-pro 请改成 0.044。",
+      "default": 0.006
+    },
+    "priceOutput": {
+      "type": "number",
+      "title": "输出价 / 百万 token，高峰价",
+      "description": "默认 1.20 = deepseek-flash 高峰价。用 v4-pro 请改成 3.96。",
+      "default": 1.2
+    },
+    "offPeakDiscount": {
+      "type": "number",
+      "title": "错峰折扣（%）",
+      "description": "官方口径：错峰价 = 高峰价的一半，即填 50。改成 0 表示不折扣。",
+      "default": 50
+    }
+  }
+}

@@ -1,0 +1,13 @@
+# 依赖
+node_modules/
+
+# 引擎在加载插件时自己生成到这里的类型声明（每个 Claude Code 版本重写一次），
+# 提交进来只会随版本变陈旧，所以不入库。本地跑 `npm run typecheck` 前，
+# 先用 `claude --plugin-dir .` 加载一次插件，或手动放一份 d.ts。
+.claude-plugin/types/claude-code/
+.claude-plugin/types/claude-code-tools/
+.claude-plugin/types/claude-code-mcp/
+.claude-plugin/types/tsconfig.json
+
+# macOS
+.DS_Store

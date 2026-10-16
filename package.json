@@ -1,0 +1,16 @@
+{
+  "name": "ccplugin-deepseek-cost-hud",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DeepSeek 余额与用量 HUD —— Claude Code 终端 / Claude Desktop 插件",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "validate": "claude plugin validate .",
+    "test": "claude plugin test ."
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}
