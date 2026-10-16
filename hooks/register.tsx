@@ -443,12 +443,20 @@ async function restoreModel($: EngineInterface): Promise<void> {
 async function costReport($: EngineInterface, cfg: Settings): Promise<string> {
   const balance = await read($, balanceAtom)
   const usage = await read($, usageAtom)
+  const error = await read($, errorAtom)
   const rows: string[] = []
 
-  if (balance) {
+  if (balance && !error) {
     rows.push(`余额        ${money(balance.total, currencySymbol(balance.currency))}（充值 ${balance.toppedUp.toFixed(2)} + 赠送 ${balance.granted.toFixed(2)}）`)
+  } else if (balance) {
+    // 有缓存但刷新失败：标明这是旧数字，别让人以为一切正常
+    rows.push(
+      `余额        ${money(balance.total, currencySymbol(balance.currency))}（充值 ${balance.toppedUp.toFixed(2)} + 赠送 ${balance.granted.toFixed(2)}）   ← 缓存值，上次刷新失败：${shortError(error)}`,
+    )
   } else {
-    rows.push('余额        尚未取到（Key 没配上：用 /plugin 的 Configure options 填，或设 DEEPSEEK_API_KEY）')
+    rows.push(
+      `余额        尚未取到（${error ? shortError(error) : '还没读过'}）—— 跑 /deepseek-key，或直接在横条上的输入框里粘贴 Key`,
+    )
   }
 
   // 花费是按模型折算的，所以先把「按哪个模型、哪套价」交代清楚。
@@ -848,9 +856,14 @@ export const register: Register = (on, options) => {
 
     // 余额拿不到时（没配 Key、或 Key 不对），**就地**给一个输入框。
     // 横条本身支持 Input（引擎文档：带子里 an Input types, a Button arms the
-    // hotkeys），所以不必另开面板。配好之后 balance 就有了，这个输入框自动消失。
+    // hotkeys），所以不必另开面板。
+    //
+    // 条件是"刷新失败且像是鉴权问题"，**不是**"没有余额" —— 因为上一个成功的
+    // 余额会被缓存下来，只按 cache 判断的话这个输入框永远不出现（踩过）。
+    const keyProblem =
+      error !== null && (error === 'no-key' || error.includes('401') || error.includes('403'))
     let keyInput: RenderElement | null = null
-    if (!balance && error && 'Input' in elements) {
+    if (keyProblem && 'Input' in elements) {
       const { Input } = elements
       keyInput = (
         <Input
@@ -861,17 +874,19 @@ export const register: Register = (on, options) => {
       )
     }
 
-    // 余额
+    // 余额。**error 优先于缓存值**：有缓存但刷新失败时，把旧数字标成"缓存"，
+    // 不能拿它冒充当前余额 —— 那会把 401 藏起来，让人以为一切正常。
     let balanceNode: RenderElement | null = null
     if (cfg.showBalance) {
-      const label = balance
-        ? money(balance.total, currencySymbol(balance.currency))
-        : error
-          ? shortError(error)
+      const label = error
+        ? shortError(error)
+        : balance
+          ? money(balance.total, currencySymbol(balance.currency))
           : '…'
       balanceNode = (
-        <Text key="balance" color={balanceLevel(balance)}>
+        <Text key="balance" color={error ? 'error' : balanceLevel(balance)}>
           {label}
+          {error && balance ? ` 缓存${money(balance.total, currencySymbol(balance.currency))}` : ''}
         </Text>
       )
     }

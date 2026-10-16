@@ -699,3 +699,51 @@ test('余额正常时横条上没有 Key 输入框', async ($, on) => {
   expect(await band.find({ text: '¥40.36' })).toBeDefined()
   expect(await band.find({ type: 'Input' })).toBeUndefined()
 })
+
+test('刷新失败时不拿缓存冒充余额：横条报错并给出 Key 输入框', async ($, on) => {
+  // 有 token 但被服务端拒绝（就是 cc-switch 代理令牌那种处境），
+  // 于是请求真的发出去、真的拿到 401
+  mock.env(on, { ANTHROPIC_AUTH_TOKEN: 'ccs-proxy-token' })
+  stubEngine(on)
+  // 缓存里有一份旧余额（session.start 会先铺上去），但实时请求会 401
+  const store = fakeStore({
+    lastModel: 'deepseek-flash',
+    balance: {
+      isAvailable: true,
+      currency: 'CNY',
+      total: 74.7,
+      granted: 5.89,
+      toppedUp: 68.81,
+      fetchedAt: 1,
+    },
+  })
+  on('http.fetch', { url: /\/user\/balance$/ }, () => ({
+    value: { status: 401, ok: false, headers: {}, text: '{"error":"auth"}' },
+  }))
+  on('process.run', () => ({
+    value: {
+      exitCode: 0,
+      stdout: '',
+      stderr: '',
+      isStdoutTruncated: false,
+      isStderrTruncated: false,
+    },
+  }))
+  await startSession($, on, () => store.stub(on))
+
+  const band = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: BAND_PROPS,
+  })
+  // 错误优先于缓存值，并把旧数字标出来
+  expect(await band.find({ text: /HTTP 401/ })).toBeDefined()
+  expect(await band.find({ text: /缓存¥74.70/ })).toBeDefined()
+  // 关键：输入框必须出现，否则用户没地方修
+  expect(await band.find({ type: 'Input' })).toBeDefined()
+
+  const report = await runCommand($, 'deepseek-cost')
+  expect(report.text).toContain('缓存值')
+  expect(report.text).toContain('HTTP 401')
+})
