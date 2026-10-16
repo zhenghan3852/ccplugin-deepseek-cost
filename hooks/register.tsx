@@ -403,6 +403,66 @@ async function restoreModel($: EngineInterface): Promise<void> {
   }
 }
 
+/** 上次铺首屏的引擎时刻；`null` = 还没铺过。用来防止同一个启动瞬间铺两次。 */
+let lastSetupAt: number | null = null
+
+/**
+ * 铺一次会话：缓存余额 → 回放模型 → 拉一次真余额 → 起定时刷新。
+ *
+ * **两个钩子都会调它**，所以必须幂等：
+ *   `session.start`        新会话开始
+ *   `classic.SessionStart` `/clear`、`/resume`、`/branch` —— 这三个会把
+ *                          `$.state` 重置回默认值，而且**不再触发 session.start**
+ *                          （引擎文档明说）。少了这条，resume 之后模型（`$.state`
+ *                          里的）被清空、门控认不出 DeepSeek，横条就**静默消失**
+ *                          —— 这就是实测出来的那个 bug。
+ */
+async function setupSession($: EngineInterface, cfg: Settings): Promise<void> {
+  const now = await $.clock.now()
+  if (lastSetupAt !== null && now - lastSetupAt < 1000) return // 同一瞬间别铺两次
+  lastSetupAt = now
+
+  // 1) 先用上次存的余额铺首屏，别让人盯着空白等网络
+  const cached = await $.store.get('balance')
+  if (cached && typeof cached === 'object') {
+    const restored = cached as Balance
+    if (typeof restored.total === 'number' && typeof restored.currency === 'string') {
+      await update($, balanceAtom, () => restored)
+    }
+  }
+
+  // 2) 回放上次确认过的模型 —— 横条出不出现就看它
+  await restoreModel($)
+
+  // 3) 拉一次真余额（有缓存也拉，让数字尽快变准）
+  await refreshBalance($, cfg)
+
+  // 4) 定时刷新。定时器归引擎的时钟管，钩子这一趟结束也照样跑；热重载会把
+  //    上一份环境连同定时器丢掉，所以这里 cancel 只是防御性的。
+  timer?.cancel()
+  timer = $.clock.every(cfg.refreshMs, () => void refreshBalance($, cfg))
+}
+
+/** 进程内缓存一次"这台机器上次确认过的模型"，见 `knownModel`。 */
+let lastModelHint: string | null = null
+
+/**
+ * 横条门控用的模型：先看 `$.state`，空则回 store 里那份"上次确认过的"。
+ *
+ * 为什么要兜底：`$.state` 会在 `/clear`、`/resume`、`/branch` 之后被重置，
+ * 而 `session.start` 不会再来 —— 只信 state 的话那些时刻横条会**静默消失**。
+ * 这条是纯读路径（渲染钩子里写 state 会自激），每个进程最多查一次 store。
+ */
+async function knownModel($: EngineInterface): Promise<string> {
+  const fromState = await read($, modelAtom)
+  if (fromState) return fromState
+  if (lastModelHint === null) {
+    const saved = await $.store.get('lastModel')
+    lastModelHint = typeof saved === 'string' ? saved.trim() : ''
+  }
+  return lastModelHint
+}
+
 /** `/deepseek-cost` 的完整报告：本会话用量明细 + 按单价折算出来的花费。 */
 async function costReport($: EngineInterface, cfg: Settings): Promise<string> {
   const balance = await read($, balanceAtom)
@@ -673,15 +733,6 @@ export const register: Register = (on, options) => {
     // 注意：本钩子在热重载后会再次触发，所以**不能**在这里重置用量 ——
     // 那会把已经攒下的数字清零。会话切换只在 session.end 里处理。
 
-    // 1) 先用上次会话存下的余额铺首屏，别让人盯着空白等网络
-    const cached = await $.store.get('balance')
-    if (cached && typeof cached === 'object') {
-      const restored = cached as Balance
-      if (typeof restored.total === 'number' && typeof restored.currency === 'string') {
-        await update($, balanceAtom, () => restored)
-      }
-    }
-
     // 2) 命令。重复注册同名命令是替换而非叠加，所以热重载后再走一遍也没事。
     await $.command.register({
       name: 'deepseek-hud',
@@ -708,18 +759,21 @@ export const register: Register = (on, options) => {
       description: '设置 DeepSeek API Key（存进插件自己的存储；CLI 用户请用 /plugin 的 Configure options）',
     })
 
-    // 3) 拉一次真实余额（有缓存也拉，让数字尽快变准），再回放上次确认的模型
-    await refreshBalance($, cfg)
-    await restoreModel($)
+    // 3) 铺首屏 + 拉余额 + 起定时刷新。和 classic.SessionStart 共用同一段 ——
+    //    因为 /clear、/resume、/branch 之后只会来后者（详见 setupSession 的注释）。
+    await setupSession($, cfg)
 
-    // 4) 起定时刷新。定时器归引擎的时钟管，钩子这一趟结束也照样跑，
-    //    直到 cancel() 或模块被重载（重载会把上一个环境的定时器一并丢掉，
-    //    所以这里 cancel 只是防御性的）。
-    timer?.cancel()
-    timer = $.clock.every(cfg.refreshMs, () => {
-      void refreshBalance($, cfg)
-    })
+    return next(e)
+  })
 
+  // ── `/clear`、`/resume`、`/branch` 之后 ──────────────────────────────
+  // 这三条会把 `$.state` 重置回默认值，而且**不再触发 session.start**（引擎文档
+  // 明说），所以模型、余额、定时器全没了 —— 门控认不出 DeepSeek，横条静默消失
+  // （用户实测报的"本来显示，resume 之后不见了"就是这个）。
+  // 引擎给的解法就是这里：在经典 SessionStart 钩子里把值重新装回去。
+
+  on('classic.SessionStart', async ($, e, next) => {
+    await setupSession($, cfg)
     return next(e)
   })
 
@@ -827,7 +881,7 @@ export const register: Register = (on, options) => {
 
     // 新会话默认不出现：只有认出来跑的是 DeepSeek 模型，这条带子才画。
     // 模型在 session.start 和每一轮里都会更新，所以中途切模型也会跟着变。
-    if (!isDeepSeekModel(await read($, modelAtom))) return next(e)
+    if (!isDeepSeekModel(await knownModel($))) return next(e)
 
     const elements = $.ui.resolve(e)
     const { Box, Text, Button } = elements

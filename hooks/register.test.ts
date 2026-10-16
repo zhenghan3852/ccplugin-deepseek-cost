@@ -696,3 +696,26 @@ test('刷新失败时不拿缓存冒充余额：横条报错并给出 Key 输入
   expect(report.text).toContain('HTTP 401')
 })
 
+
+test('resume/clear 之后横条还在：不靠 session.start 也能认出模型', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
+  stubBalance(on)
+  mock.clock(on)
+  const store = fakeStore({ lastModel: 'deepseek-flash' })
+  store.stub(on)
+  on('classic.SessionStart', () => ({}))
+
+  // 关键：**不触发 session.start** —— /clear、/resume、/branch 会把 $.state 重置
+  // 回默认值且不再触发它。这正是"本来显示、resume 之后不见了"那个 bug 的现场。
+  await $.classic.SessionStart({ source: 'resume' })
+
+  const band = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: BAND_PROPS,
+  })
+  // 模型从 store 回放出来了，余额也铺上了 —— 横条必须还在
+  expect(await band.find({ text: '¥40.36' })).toBeDefined()
+})
