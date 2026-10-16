@@ -543,8 +543,8 @@ test('配置面板：只列本插件的行，改动写回配置', async ($, on) 
   expect(await pane.find({ text: '显示花费进度条' })).toBeDefined()
   // 引擎自己的行不该混进来
   expect(await pane.find({ text: 'Theme' })).toBeUndefined()
-  // Key 不在面板里，但要有指路的话
-  expect(await pane.find({ text: /API Key 不在上面/ })).toBeDefined()
+  // Key 单独走一行输入（本会话有效），不在配置行里
+  expect(await pane.find({ text: /API Key（本会话）/ })).toBeDefined()
 
   // 按下开关：写回的是反向值，key 原样带完整 pluginId
   await pane.press({ key: 'v-showCycle' })
@@ -624,6 +624,36 @@ test('配置面板：一行都没匹配上时，把引擎实际报的 key 印出
   })
   expect(await pane.find({ text: /没读到本插件的配置行/ })).toBeDefined()
   expect(await pane.find({ text: /theme/ })).toBeDefined()
+})
+
+test('配置面板：回车输入的 Key 设进本会话环境，不落盘', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
+  stubBalance(on)
+  const envSets: { name: string; value?: string }[] = []
+  on('env.set', ($, e) => {
+    envSets.push({ name: e.name, value: e.value })
+    return { value: undefined }
+  })
+  on('config.list', () => ({ value: [] }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.invalidate', () => ({ value: undefined }))
+  await startSession($, on)
+  await runCommand($, 'deepseek-config')
+
+  const pane = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'deepseek-config',
+    viewport: { columns: 100, rows: 40 },
+    props: PANE_PROPS,
+  })
+  // 走 $.env.set（只作用于进程），既不写 store 也不进会话记录
+  await pane.input({ key: 'v-apiKey', text: 'sk-session-only' })
+  expect(envSets).toEqual([{ name: 'DEEPSEEK_API_KEY', value: 'sk-session-only' }])
+  // 面板上要如实写明这条的代价
+  expect(await pane.find({ text: /只对本会话有效/ })).toBeDefined()
 })
 
 test('每走完一轮就多一次抽奖机会，次数记在全局账本上', async ($, on) => {

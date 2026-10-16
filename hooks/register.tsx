@@ -555,6 +555,26 @@ async function openConfigPane($: EngineInterface): Promise<string> {
   return '配置面板已打开；改完运行 /reload-plugins 生效。'
 }
 
+/**
+ * 把 Key 设进**本会话的进程环境**：就地可用，且不落盘、不进提示符、不进
+ * transcript（这是它能做到的、比明文存储安全的地方）。
+ *
+ * 代价说清楚：`$.env.set` 只作用于进程，所以**只对本会话有效**，重启或新会话
+ * 要重填。要一次配好且持久，用 shell 的 `claude plugin configure`（写进系统
+ * 凭据库）。两条都不落明文。
+ */
+async function setSessionKey(
+  $: EngineInterface,
+  cfg: Settings,
+  typed: string,
+): Promise<void> {
+  const key = typed.trim()
+  if (!key) return
+  await $.env.set('DEEPSEEK_API_KEY', key)
+  await refreshBalance($, cfg)
+  await $.ui.invalidate('ui.render')
+}
+
 /** 推进一帧；走完就停在开奖态并停表。 */
 async function advanceSpin($: EngineInterface): Promise<void> {
   const spin = await read($, spinAtom)
@@ -1029,9 +1049,18 @@ export const register: Register = (on, options) => {
             {all.map((row) => row.key).join('  ') || '空列表'}）
           </Text>
         ) : null}
-        <Text dimColor>改完运行 /reload-plugins 生效 —— 配置是插件加载时读的</Text>
-        <Text dimColor>API Key 不在上面：它标了 sensitive，只经 /plugin 的 Configure options</Text>
-        <Text dimColor>或 shell 的 claude plugin configure 设置，不会落到明文文件里</Text>
+        <Box flexDirection="row" gap={1}>
+          <Text>API Key（本会话）</Text>
+          {/* 故意不给 value：提交后输入框自己清空，Key 不会停在画面上 */}
+          <Input
+            key="v-apiKey"
+            placeholder="sk-… 回车保存"
+            onSubmit={(text) => void setSessionKey($, cfg, text)}
+          />
+        </Box>
+        <Text dimColor>上面这行只对本会话有效、不落盘、不进会话记录 —— 重启或新会话要重填</Text>
+        <Text dimColor>要一次配好且持久：shell 里 claude plugin configure，值进系统凭据库</Text>
+        <Text dimColor>改完配置项记得运行 /reload-plugins 生效（配置是插件加载时读的）</Text>
         <Button key="close" label="关闭" onPress={() => void $.ui.close({ id: CONFIG_PANE })} />
       </Box>
     )
