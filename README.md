@@ -149,6 +149,7 @@ export DEEPSEEK_API_KEY="sk-xxxxxxxxxxxxxxxx"
 | `/deepseek-refresh` | 立刻刷新余额 |
 | `/deepseek-draw` | 用攒下的次数抽一次奖（像素转盘） |
 | `/deepseek-dex` | 看抽奖图鉴：各档收集进度与已抽到的物品 |
+| `/deepseek-config` | 在会话里改插件配置（API Key 除外，见下） |
 
 `/deepseek-cost` 的样子：
 
@@ -174,7 +175,7 @@ token       ↑125.3k（缓存命中 15.7M / 未命中 125.3k）  ↓54.4k   共
 /deepseek-dex     图鉴：各档收集进度 + 已经抽到过哪些
 ```
 
-抽奖会开一个面板播动画（终端、Desktop、VS Code 都支持）。**次数是攒着的，不会自动弹** —— 你想抽的时候自己跑命令。
+两个命令都会开一个**面板**（终端、Desktop、VS Code 都支持），面板放不下时退回文本，信息不丢。**次数是攒着的，不会自动弹** —— 你想抽的时候自己跑命令。
 
 ### 五个档位与 100 件物品
 
@@ -196,11 +197,36 @@ token       ↑125.3k（缓存命中 15.7M / 未命中 125.3k）  ↓54.4k   共
 
 画法上有一点是硬约束：引擎的渲染元素里只有 `Box` / `Text` 在终端和 Desktop 上**都**支持 `backgroundColor`（`Raster` 只有终端、`Svg` 只有 Desktop），所以转盘只能用它们拼、只写这一份。
 
+还有一个只在修 bug 时才会发现的坑：**色块不要用普通空格填**。终端的空格一格一格占位，底色正好透出来；但桌面端的渲染器会把**连续普通空格折叠掉**，11 格宽的圆环会被压成两三格（真出现过：侧栏里的转盘是扁的）。所以桌面端用不换行空格 ` `，终端才用普通空格 —— 见 `cellFill()`。
+
 ---
 
 ## 配置项
 
-在 `/plugin` 或 `/config` 里改，也可以写进 `settings.json` 的 `pluginConfigs`。
+改配置有三条路，按场景挑：
+
+| 场景 | 怎么改 |
+|---|---|
+| 在会话里，想随手点着改 | **`/deepseek-config`** —— 开一个会话内面板，见下 |
+| 要改 **API Key** | `/plugin` → **Installed** 标签 → 插件 → **Configure options**；或 shell 里 `claude plugin configure deepseek-cost-hud --values-stdin`。`/deepseek-config` 改不了它（见下） |
+| 写进文件 | `settings.json` 的 `pluginConfigs`（注意敏感值不走这里） |
+
+### 在会话里改配置：`/deepseek-config`
+
+```
+/deepseek-config
+```
+
+开一个面板，列出本插件所有**非敏感**的配置项，按类型给对应控件：开关给按钮、`choice` 给选择器、数字和文本给输入框。改动通过 `$.config.set()` 写回，被拒时弹提示而不是假装成功。
+
+两条如实写在面板上的限制：
+
+- **API Key 不在其中。** 它标了 `sensitive`，引擎不给敏感字段建 `/config` 行，所以读不到也写不了。Key 只能走上面表格里那条安全路径 —— 这本来就是对的，Key 不该经提示符。
+- **改完要 `/reload-plugins` 才生效。** 配置是插件加载时一次性读走的（`register()` 里 `readSettings(options)`），所以会话中途改的值要到重载后才起作用。
+
+> 为什么要自己画这个面板：桌面端的 **Settings → Plugins** 页不给插件留位置 —— 引擎的渲染站点一共 15 个，全在**会话内**（`AbovePrompt`、`Pane`、`CommandOutput`…），没有一个能画进应用设置窗口。所以"在会话里开一个面板"是能做到的最接近的形态。
+
+配置项一览：
 
 | 配置 | 默认 | 说明 |
 |---|---|---|

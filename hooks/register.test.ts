@@ -408,10 +408,12 @@ test('转盘逐帧推进，走完停在开奖态', async ($, on) => {
   expect(await pane.find({ text: /普通|稀有|罕见|史诗|传说/ })).toBeDefined()
 })
 
-test('图鉴：给出待抽次数与各档收集进度', async ($, on) => {
+test('图鉴：命令回一行汇总，明细在面板里按档列出来', async ($, on) => {
   mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
   stubEngine(on)
   stubBalance(on)
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.invalidate', () => ({ value: undefined }))
   const store = fakeStore({
     gacha: { spent: 5, drawn: 2, owned: { tissue: 1, 'milk-tea': 1 } },
   })
@@ -420,10 +422,142 @@ test('图鉴：给出待抽次数与各档收集进度', async ($, on) => {
   const answer = await runCommand($, 'deepseek-dex')
   expect(answer.text).toContain('3 次') // floor(5) - 2
   expect(answer.text).toContain('图鉴 2/100')
+
+  const pane = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'deepseek-dex',
+    viewport: { columns: 100, rows: 40 },
+    props: PANE_PROPS,
+  })
+  expect(await pane.find({ text: /普通 1\/70/ })).toBeDefined()
+  expect(await pane.find({ text: /一包抽纸×1/ })).toBeDefined()
+  expect(await pane.find({ text: /稀有 1\/15/ })).toBeDefined()
+  expect(await pane.find({ text: /一杯奶茶×1/ })).toBeDefined()
+  // 一件都没抽到的档位也要露脸，标成"还没抽到"
+  expect(await pane.find({ text: /传说 0\/2/ })).toBeDefined()
+})
+
+test('图鉴：面板放不下时回退成完整文本，信息不丢', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
+  stubBalance(on)
+  on('ui.open', () => ({ value: { isPlaced: false, reason: '终端太窄' } }))
+  const store = fakeStore({
+    gacha: { spent: 5, drawn: 2, owned: { tissue: 1 } },
+  })
+  await startSession($, on, () => store.stub(on))
+
+  const answer = await runCommand($, 'deepseek-dex')
   expect(answer.text).toContain('普通（≈¥1）  1/70')
   expect(answer.text).toContain('一包抽纸×1')
-  expect(answer.text).toContain('稀有（≈¥5）  1/15')
-  expect(answer.text).toContain('一杯奶茶×1')
+  expect(answer.text).toContain('传说（≈¥1000）  0/2')
+})
+
+test('配置面板：只列本插件的行，改动写回配置', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
+  stubBalance(on)
+  const sets: { key: string; value: unknown }[] = []
+  on('config.list', () => ({
+    value: [
+      // 引擎自己的一行：不该出现在我们的面板里
+      {
+        key: 'theme',
+        label: 'Theme',
+        kind: 'choice',
+        value: 'dark',
+        options: ['dark', 'light'],
+        provider: { plugin: 'engine', tier: 'core' },
+        isLocked: false,
+      },
+      {
+        key: 'deepseek-cost-hud.showCycle',
+        label: '显示花费进度条',
+        kind: 'boolean',
+        value: true,
+        provider: { plugin: PLUGIN, tier: 'user' },
+        isLocked: false,
+      },
+      {
+        key: 'deepseek-cost-hud.priceCurrency',
+        label: '估算值的货币',
+        kind: 'choice',
+        value: 'CNY',
+        options: ['CNY', 'USD'],
+        provider: { plugin: PLUGIN, tier: 'user' },
+        isLocked: false,
+      },
+    ],
+  }))
+  on('config.set', ($, e) => {
+    sets.push({ key: e.key, value: e.value })
+    return { value: e.value }
+  })
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.invalidate', () => ({ value: undefined }))
+  await startSession($, on)
+
+  const answer = await runCommand($, 'deepseek-config')
+  expect(answer.text).toContain('配置面板已打开')
+
+  const pane = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'deepseek-config',
+    viewport: { columns: 100, rows: 40 },
+    props: PANE_PROPS,
+  })
+  expect(await pane.find({ text: '显示花费进度条' })).toBeDefined()
+  // 引擎自己的行不该混进来
+  expect(await pane.find({ text: 'Theme' })).toBeUndefined()
+  // Key 不在面板里，但要有指路的话
+  expect(await pane.find({ text: /API Key 不在上面/ })).toBeDefined()
+
+  // 按下开关：写回的是反向值
+  await pane.press({ key: 'v-showCycle' })
+  expect(sets).toEqual([{ key: 'deepseek-cost-hud.showCycle', value: false }])
+})
+
+test('配置面板：被拒绝时给出提示，不假装改成功', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
+  stubBalance(on)
+  const toasts: string[] = []
+  on('config.list', () => ({
+    value: [
+      {
+        key: 'deepseek-cost-hud.showCycle',
+        label: '显示花费进度条',
+        kind: 'boolean',
+        value: true,
+        provider: { plugin: PLUGIN, tier: 'user' },
+        isLocked: false,
+      },
+    ],
+  }))
+  on('config.set', () => ({ deny: '锁定策略不让改' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.invalidate', () => ({ value: undefined }))
+  on('ui.toast', ($, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+  await startSession($, on)
+  await runCommand($, 'deepseek-config')
+
+  const pane = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'deepseek-config',
+    viewport: { columns: 100, rows: 40 },
+    props: PANE_PROPS,
+  })
+  await pane.press({ key: 'v-showCycle' })
+  expect(toasts).toEqual(['没改成：锁定策略不让改'])
 })
 
 test('每走完一轮就多一次抽奖机会，次数记在全局账本上', async ($, on) => {

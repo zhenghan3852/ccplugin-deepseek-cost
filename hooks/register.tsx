@@ -33,11 +33,14 @@
 
 import { atom, read, update } from 'claude-code'
 import type {
+  ConfigRow,
+  ConfigValue,
   EngineInterface,
   PluginOptions,
   Register,
   RenderElement,
   RenderNode,
+  RenderSurface,
 } from 'claude-code'
 
 import type { Balance, GachaRecord, HudError, Spin, TierId, Usage } from '../types'
@@ -456,8 +459,75 @@ function dexLines(record: GachaRecord): string[] {
 // Svg 只有 Desktop，单实现都用不了。
 
 const GACHA_PANE = 'deepseek-gacha'
+const CONFIG_PANE = 'deepseek-config'
+const DEX_PANE = 'deepseek-dex'
+
+/**
+ * 一个色块的填充字符。
+ *
+ * 终端用普通空格 —— 底色从空格里透出来，正好占满一格。
+ * **桌面端要用不换行空格**：那边的渲染器会把连续普通空格折叠掉，于是 11 格宽
+ * 的圆环被压成两三格（真出现过：侧面弹出来的转盘是扁的）。不换行空格不折叠。
+ */
+function cellFill(surface: RenderSurface, width: number): string {
+  return (surface === 'terminal' ? ' ' : ' ').repeat(width)
+}
 
 let spinTimer: { cancel: () => void } | null = null
+
+// ── 配置面板 ────────────────────────────────────────────────────────
+//
+// 桌面端的 Settings → Plugins 页不给插件留位置（渲染站点全在会话内），所以
+// 配置界面只能自己画：`$.config.list()` 读、`$.config.set()` 写。
+//
+// 两件事如实写在面板上，不假装能做：
+//   · API Key 不在其中 —— 它标了 sensitive，引擎不给敏感字段建 `/config` 行
+//   · 改动要 /reload-plugins 才生效 —— 配置是 register() 时一次性读走的
+
+/** 本插件 userConfig 行的 key 前缀。 */
+const CONFIG_PREFIX = 'deepseek-cost-hud.'
+
+function ownConfigRows(rows: readonly ConfigRow[]): ConfigRow[] {
+  return rows.filter((row) => row.key.startsWith(CONFIG_PREFIX))
+}
+
+/** 配置值上屏的写法。 */
+function configValueText(value: ConfigValue): string {
+  return Array.isArray(value) ? value.join(', ') : String(value)
+}
+
+/** 输入框的文本按该行的类型落地；数字行给了非数字就原样退回旧值。 */
+function parseConfigInput(row: ConfigRow, text: string): ConfigValue {
+  if (row.kind !== 'number') return text
+  const parsed = Number(text)
+  return Number.isFinite(parsed) ? parsed : row.value
+}
+
+/** 写回一个配置项，并让面板重画（写状态不行 —— 那是渲染钩子里的事）。 */
+async function setConfig($: EngineInterface, key: string, value: ConfigValue): Promise<void> {
+  const result = await $.config.set({ key, value })
+  if (result.deny) {
+    $.ui.toast(`没改成：${result.deny}`)
+    return
+  }
+  await $.ui.invalidate('ui.render')
+}
+
+/** 打开配置面板；返回给命令说的那句话。 */
+async function openConfigPane($: EngineInterface): Promise<string> {
+  const opened = await $.ui.open({
+    id: CONFIG_PANE,
+    title: '插件配置',
+    focus: true,
+    closeOnEscape: true,
+    columns: 46,
+    rows: 28,
+  })
+  if (!opened.isPlaced) {
+    return '面板放不下。改配置请走 /plugin 的 Configure options，或 shell 里 claude plugin configure。'
+  }
+  return '配置面板已打开；改完运行 /reload-plugins 生效。'
+}
 
 /** 推进一帧；走完就停在开奖态并停表。 */
 async function advanceSpin($: EngineInterface): Promise<void> {
@@ -507,11 +577,15 @@ async function startDraw($: EngineInterface): Promise<string> {
   }))
 
   const headline = `${TIER_BY_ID[tier].name} · ${item.name}`
+  // columns / rows 都是"请求"：docked 时按 columns 开宽，inline 时按 rows 开高。
+  // 转盘本身 11 格宽，加上结果行和按钮，给 30 列才不至于挤成一团。
   const opened = await $.ui.open({
     id: GACHA_PANE,
     title: '抽奖',
     focus: true,
     closeOnEscape: true,
+    columns: 30,
+    rows: 20,
   })
 
   if (!opened.isPlaced) {
@@ -523,6 +597,35 @@ async function startDraw($: EngineInterface): Promise<string> {
   spinTimer?.cancel()
   spinTimer = $.clock.every(WHEEL_TICK_MS, () => void advanceSpin($))
   return `抽到了：${headline}`
+}
+/** 图鉴的汇总数字。 */
+function dexSummary(record: GachaRecord): { collected: number; pending: number } {
+  return {
+    collected: ITEMS.filter((item) => (record.owned[item.id] ?? 0) > 0).length,
+    pending: pendingDraws(record),
+  }
+}
+
+/**
+ * 打开图鉴面板；返回给命令说的那句话。
+ * 面板放不下时把完整文本一并给出去，信息不丢。
+ */
+async function openDexPane($: EngineInterface): Promise<string> {
+  const record = await readGacha($)
+  const { collected, pending } = dexSummary(record)
+  const line = `待抽 ${pending} 次 · 已抽 ${record.drawn} 次 · 图鉴 ${collected}/${ITEMS.length}`
+
+  const opened = await $.ui.open({
+    id: DEX_PANE,
+    title: '图鉴',
+    focus: true,
+    closeOnEscape: true,
+    columns: 46,
+    rows: 30,
+  })
+  if (!opened.isPlaced) return `${line}\n\n${dexLines(record).join('\n')}`
+  await $.ui.invalidate('ui.render')
+  return line
 }
 
 export const register: Register = (on, options) => {
@@ -563,6 +666,10 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'deepseek-dex',
       description: '看抽奖图鉴：各档收集进度与已抽到的物品',
+    })
+    await $.command.register({
+      name: 'deepseek-config',
+      description: '在会话里改插件配置（API Key 除外，面板上有说明）',
     })
 
     // 3) 拉一次真实余额（有缓存也拉，让数字尽快变准），再回放上次确认的模型
@@ -669,10 +776,11 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'deepseek-draw' }, async ($) => ({ text: await startDraw($) }))
 
-  on('command.run', { command: 'deepseek-dex' }, async ($) => {
-    const record = await readGacha($)
-    return { text: dexLines(record).join('\n') }
-  })
+  on('command.run', { command: 'deepseek-dex' }, async ($) => ({ text: await openDexPane($) }))
+
+  on('command.run', { command: 'deepseek-config' }, async ($) => ({
+    text: await openConfigPane($),
+  }))
 
   // ── 横条本体 ──────────────────────────────────────────────────────
   // AbovePrompt 只在 terminal 和 desktop 两个 surface 上拉起，所以这一个钩子
@@ -764,6 +872,7 @@ export const register: Register = (on, options) => {
     if (spin.phase === 'idle' || !spin.tier) return next(e)
 
     const { Box, Text, Button } = $.ui.resolve(e)
+    const surface = e.surface
     const tier = TIER_BY_ID[spin.tier]
     const item = spin.itemId ? ITEM_BY_ID[spin.itemId] : undefined
     const revealed = spin.phase === 'revealed'
@@ -772,10 +881,10 @@ export const register: Register = (on, options) => {
       <Box key={`row${y}`} flexDirection="row">
         {encodeRow(cells).map((run, x) =>
           run.color === null ? (
-            <Text key={`cell${x}`}>{' '.repeat(run.width)}</Text>
+            <Text key={`cell${x}`}>{cellFill(surface, run.width)}</Text>
           ) : (
             <Text key={`cell${x}`} backgroundColor={run.color}>
-              {' '.repeat(run.width)}
+              {cellFill(surface, run.width)}
             </Text>
           ),
         )}
@@ -806,6 +915,107 @@ export const register: Register = (on, options) => {
           ) : null}
           <Button key="close" label="关闭" onPress={() => void $.ui.close({ id: GACHA_PANE })} />
         </Box>
+      </Box>
+    )
+  })
+
+  // ── 配置面板 ──────────────────────────────────────────────────────
+
+  on('ui.render', { component: 'Pane' }, async ($, e, next) => {
+    if (e.requestId !== CONFIG_PANE) return next(e)
+
+    const rows = ownConfigRows(await $.config.list())
+    const elements = $.ui.resolve(e)
+    // 元素表按 surface 给，是个联合类型：有的 surface 没有 Input / Select。
+    // 真遇到就交回引擎自己画，别硬撑一个改不了的配置面板。
+    if (!('Input' in elements) || !('Select' in elements)) return next(e)
+    const { Box, Text, Button, Input, Select } = elements
+
+    const controls = rows.map((row) => {
+      const name = row.key.slice(CONFIG_PREFIX.length)
+      let control: RenderElement
+      if (row.kind === 'boolean') {
+        control = (
+          <Button
+            key={`v-${name}`}
+            label={row.value === true ? '开' : '关'}
+            onPress={() => void setConfig($, row.key, row.value !== true)}
+          />
+        )
+      } else if (row.kind === 'choice') {
+        control = (
+          <Select
+            key={`v-${name}`}
+            options={(row.options ?? []).map((value) => ({ value }))}
+            value={configValueText(row.value)}
+            onSelect={(value) => void setConfig($, row.key, value)}
+          />
+        )
+      } else {
+        control = (
+          <Input
+            key={`v-${name}`}
+            value={configValueText(row.value)}
+            onSubmit={(text) => void setConfig($, row.key, parseConfigInput(row, text))}
+          />
+        )
+      }
+      return (
+        <Box key={row.key} flexDirection="row" gap={1}>
+          <Text>{row.label}</Text>
+          {control}
+        </Box>
+      )
+    })
+
+    return (
+      <Box flexDirection="column">
+        <Text bold>插件配置</Text>
+        {controls}
+        <Text dimColor>改完运行 /reload-plugins 生效 —— 配置是插件加载时读的</Text>
+        <Text dimColor>API Key 不在上面：它标了 sensitive，只经 /plugin 的 Configure options</Text>
+        <Text dimColor>或 shell 的 claude plugin configure 设置，不会落到明文文件里</Text>
+        <Button key="close" label="关闭" onPress={() => void $.ui.close({ id: CONFIG_PANE })} />
+      </Box>
+    )
+  })
+
+  // ── 图鉴面板 ──────────────────────────────────────────────────────
+
+  on('ui.render', { component: 'Pane' }, async ($, e, next) => {
+    if (e.requestId !== DEX_PANE) return next(e)
+
+    const record = await readGacha($)
+    const { collected, pending } = dexSummary(record)
+    const { Box, Text, Button } = $.ui.resolve(e)
+
+    const tiers = TIERS.map((tier) => {
+      const pool = ITEMS_BY_TIER[tier.id]
+      const owned = pool.filter((item) => (record.owned[item.id] ?? 0) > 0)
+      return (
+        <Box key={tier.id} flexDirection="column">
+          <Text bold color={tier.color}>
+            {tier.name} {owned.length}/{pool.length}
+          </Text>
+          {owned.length > 0 ? (
+            <Text>{owned.map((item) => `${item.name}×${record.owned[item.id] ?? 1}`).join('  ')}</Text>
+          ) : (
+            <Text dimColor>还没抽到</Text>
+          )}
+        </Box>
+      )
+    })
+
+    return (
+      <Box flexDirection="column">
+        <Text bold>
+          图鉴 {collected}/{ITEMS.length}
+        </Text>
+        <Text dimColor>
+          待抽 {pending} 次 · 已抽 {record.drawn} 次
+        </Text>
+        {tiers}
+        <Button key="close" label="关闭" onPress={() => void $.ui.close({ id: DEX_PANE })} />
       </Box>
     )
   })
