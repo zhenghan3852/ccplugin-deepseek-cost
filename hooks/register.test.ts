@@ -168,8 +168,8 @@ test('花费进度条走满一轮就归零，并标出已经走满的轮数', as
   await startSession($, on)
 
   // 时钟从 0 起步（1970-01-01 周四 00:00 UTC），按错峰算，单价是高峰价的一半：
-  // 2 亿输出 token × $1.20/M × 50% = $120 —— 走满一轮后余下 $20，即 20%。
-  await $.turn.complete({ ...TURN, usage: { ...TURN.usage, output_tokens: 200_000_000 } })
+  // 3000 万输出 token × ¥8/M × 50% = ¥120 —— 走满一轮后余下 ¥20，即 20%。
+  await $.turn.complete({ ...TURN, usage: { ...TURN.usage, output_tokens: 30_000_000 } })
 
   const ui = await $.ui.mount({
     plugin: PLUGIN,
@@ -181,5 +181,5 @@ test('花费进度条走满一轮就归零，并标出已经走满的轮数', as
   // find 不认 key（键不在挂载出来的 props 里），所以按文本断言整条横条
   const band = await ui.find({ text: /×1/ })
   expect(band?.text).toMatch(/20\.0%/)
-  expect(band?.text).toMatch(/\$100 ×1/)
+  expect(band?.text).toMatch(/¥100 ×1/)
 })

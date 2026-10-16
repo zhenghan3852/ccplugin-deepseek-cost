@@ -1,7 +1,7 @@
 {
   "name": "deepseek-cost-hud",
   "displayName": "DeepSeek Cost HUD",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "DeepSeek 余额与用量 HUD —— 同时绘制在 Claude Code 终端与 Claude Desktop 输入框上方",
   "author": {
     "name": "zhenghan3852",
@@ -52,27 +52,27 @@
     "priceCurrency": {
       "type": "string",
       "title": "估算值的货币",
-      "description": "只影响估算花费那一栏的货币符号；余额一栏永远用接口返回的币种。",
-      "default": "USD",
-      "options": ["USD", "CNY"]
+      "description": "只影响估算花费那一栏的货币符号，必须和下面三个单价的币种一致；余额一栏永远用接口返回的币种。",
+      "default": "CNY",
+      "options": ["CNY", "USD"]
     },
     "priceInput": {
       "type": "number",
       "title": "输入价（缓存未命中，高峰价）",
-      "description": "每百万 token。默认 0.30 = DeepSeek 官方 deepseek-flash 高峰价（美元）；用 v4-pro 请改成 1.32。",
-      "default": 0.3
+      "description": "每百万 token。默认 2 = DeepSeek 官方 deepseek-flash 高峰价（人民币）；用 v4-pro 请改成 9，用美元价目请改成 0.30。",
+      "default": 2
     },
     "priceCacheRead": {
       "type": "number",
       "title": "输入价（缓存命中，高峰价）",
-      "description": "每百万 token。默认 0.006 = deepseek-flash 高峰价；用 v4-pro 请改成 0.044。",
-      "default": 0.006
+      "description": "每百万 token。默认 0.04 = deepseek-flash 高峰价（人民币）；用 v4-pro 请改成 0.30，用美元价目请改成 0.006。",
+      "default": 0.04
     },
     "priceOutput": {
       "type": "number",
       "title": "输出价（高峰价）",
-      "description": "每百万 token。默认 1.20 = deepseek-flash 高峰价；用 v4-pro 请改成 3.96。",
-      "default": 1.2
+      "description": "每百万 token。默认 8 = deepseek-flash 高峰价（人民币）；用 v4-pro 请改成 27，用美元价目请改成 1.20。",
+      "default": 8
     },
     "offPeakDiscount": {
       "type": "number",

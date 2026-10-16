@@ -92,7 +92,7 @@ function asBoolean(value: unknown, fallback: boolean): boolean {
 }
 
 function readSettings(options: PluginOptions): Settings {
-  const currency = asString(options?.priceCurrency, 'USD')
+  const currency = asString(options?.priceCurrency, 'CNY')
   const discount = Math.min(100, Math.max(0, asNumber(options?.offPeakDiscount, 50)))
   return {
     apiKey: asString(options?.apiKey),
@@ -101,9 +101,9 @@ function readSettings(options: PluginOptions): Settings {
     showCycle: asBoolean(options?.showCycle, true),
     showUsage: asBoolean(options?.showUsage, true),
     showBalance: asBoolean(options?.showBalance, true),
-    priceInput: asNumber(options?.priceInput, 0.3),
-    priceCacheRead: asNumber(options?.priceCacheRead, 0.006),
-    priceOutput: asNumber(options?.priceOutput, 1.2),
+    priceInput: asNumber(options?.priceInput, 2),
+    priceCacheRead: asNumber(options?.priceCacheRead, 0.04),
+    priceOutput: asNumber(options?.priceOutput, 8),
     priceCurrency: currency,
     priceSymbol: currency === 'CNY' ? '¥' : '$',
     // 官方口径：错峰价 = 高峰价的一半
