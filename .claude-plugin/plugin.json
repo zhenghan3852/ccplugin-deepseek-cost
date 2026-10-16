@@ -43,12 +43,6 @@
       "description": "横条上是否显示本会话 token 用量与花费。",
       "default": true
     },
-    "showEstimate": {
-      "type": "boolean",
-      "title": "并列显示估算值",
-      "description": "在实测消耗旁用括号并列显示估算值，便于看出估算准不准。",
-      "default": true
-    },
     "balanceApiBase": {
       "type": "string",
       "title": "余额 API 地址",

@@ -17,19 +17,18 @@
  *
  *   余额        `GET /user/balance`，用 API key 真实拉取。权威值，不是估算。
  *
- *   实测消耗    会话开始时记下余额，之后每轮刷新再读，两者之差就是这段会话
- *               真实花掉的钱。同样是实测值，含 DeepSeek 给的任何折扣，
- *               不需要我们对计价规则建模。前提是这把 key 在会话期间没有别的
- *               程序在并发消费，否则差额会偏大。
- *
  *   token 数    每轮 `turn.complete` 带回来的 usage 逐轮累加，是 API 报告的真实
  *               计数。DeepSeek 官方 API Reference 只有 Chat Completions、
  *               Responses、FIM、Lists Models、Get User Balance 和 Files，
  *               **没有**用量或账单查询接口，所以「用量」只能这样从响应里攒。
  *
- *   估算花费    按单价折算，只作对照。它和实测值并列显示，就是为了让人一眼看出
- *               估算准不准（`/deepseek-cost` 里给出偏差百分比）。每一轮按该轮
- *               发生时刻选单价，所以跨高峰/错峰的长会话会自动把两种价都算进去。
+ *   花费        只能估算，即 token 数 × 单价。
+ *               余额差额看着像「实测」，但不能当会话消耗用：余额是账户级的、
+ *               不带归属信息，同一账户下别的会话或程序花掉的钱同样会从差额里
+ *               掉下来，于是被算到本会话头上 —— 同时开两个会话就能算出两倍的
+ *               钱。token 数才是按会话上报的，能正确归属，所以会话花费一律以
+ *               估算为准。每一轮按该轮发生时刻选单价，跨高峰/错峰的长会话会
+ *               自动把两种价都算进去。
  */
 
 import { atom, read, update } from 'claude-code'
@@ -54,8 +53,6 @@ const EMPTY_USAGE: Usage = {
   cacheWriteTokens: 0,
   turns: 0,
   model: '',
-  startBalance: null,
-  startCurrency: '',
   estimatedCost: 0,
 }
 
@@ -73,7 +70,6 @@ type Settings = {
   showCycle: boolean
   showUsage: boolean
   showBalance: boolean
-  showEstimate: boolean
   priceInput: number
   priceCacheRead: number
   priceOutput: number
@@ -105,7 +101,6 @@ function readSettings(options: PluginOptions): Settings {
     showCycle: asBoolean(options?.showCycle, true),
     showUsage: asBoolean(options?.showUsage, true),
     showBalance: asBoolean(options?.showBalance, true),
-    showEstimate: asBoolean(options?.showEstimate, true),
     priceInput: asNumber(options?.priceInput, 0.3),
     priceCacheRead: asNumber(options?.priceCacheRead, 0.006),
     priceOutput: asNumber(options?.priceOutput, 1.2),
@@ -123,8 +118,7 @@ function readSettings(options: PluginOptions): Settings {
 // 其余时段 —— 包括整个周末 —— 都算错峰，错峰价是高峰价的一半。
 //
 // 已知不足：官方口径里「中国法定节假日全天算错峰」，而这里只判了周末，
-// 没有节假日数据表。所以在法定节假日当天，估算值会偏高一点。实测值
-// （余额差额）不受影响，它把任何折扣都算进去了。
+// 没有节假日数据表。所以在法定节假日当天，估算值会偏高一点。
 
 function isPeak(atMs: number): boolean {
   const at = new Date(atMs)
@@ -238,18 +232,6 @@ function shortError(error: HudError): string {
   return error.length > 24 ? `${error.slice(0, 21)}...` : error
 }
 
-/**
- * 实测消耗 = 会话开始时的余额 − 现在的余额。
- * 拿不到（没读过起始余额、币种变了、中途充值导致差额为负）时返回 null。
- */
-function measuredSpend(usage: Usage, balance: Balance | null): { amount: number; currency: string } | null {
-  if (usage.startBalance === null || balance === null) return null
-  if (balance.currency !== usage.startCurrency) return null
-  const amount = usage.startBalance - balance.total
-  if (amount <= 0) return null
-  return { amount, currency: balance.currency }
-}
-
 function cacheHitRate(usage: Usage): number | null {
   const billedInput = usage.inputTokens + usage.cacheWriteTokens + usage.cacheReadTokens
   if (billedInput <= 0) return null
@@ -322,16 +304,6 @@ async function refreshBalance($: EngineInterface, cfg: Settings): Promise<void> 
       fetchedAt: await $.clock.now(),
     }
 
-    // 本会话第一次读到余额时把它记成基准，之后就能算实测消耗
-    const current = await read($, usageAtom)
-    if (current.startBalance === null) {
-      await update($, usageAtom, prev => ({
-        ...prev,
-        startBalance: next.total,
-        startCurrency: next.currency,
-      }))
-    }
-
     await update($, balanceAtom, () => next)
     await update($, errorAtom, () => null)
     // 存一份，下次会话首屏就能立刻显示真实余额，不用等网络
@@ -343,7 +315,7 @@ async function refreshBalance($: EngineInterface, cfg: Settings): Promise<void> 
   }
 }
 
-/** `/deepseek-cost` 的完整报告 —— 实测和估算摆在一起看偏差。 */
+/** `/deepseek-cost` 的完整报告：本会话用量明细 + 按单价折算出来的花费。 */
 async function costReport($: EngineInterface, cfg: Settings): Promise<string> {
   const balance = await read($, balanceAtom)
   const usage = await read($, usageAtom)
@@ -360,27 +332,13 @@ async function costReport($: EngineInterface, cfg: Settings): Promise<string> {
     return rows.join('\n')
   }
 
-  const measured = measuredSpend(usage, balance)
-  if (usage.startBalance !== null) {
-    rows.push(`会话起始    ${usage.startBalance.toFixed(2)} ${usage.startCurrency}`)
-  }
-
-  if (measured) {
-    const measuredText = moneyFine(measured.amount, currencySymbol(measured.currency))
-    rows.push(`实测消耗    ${measuredText}   （余额差额，含官方一切折扣）`)
-    if (cfg.showEstimate && usage.estimatedCost > 0) {
-      // 币种不同就不能直接比，只并列摆出来
-      if (measured.currency === cfg.priceCurrency) {
-        const delta = (usage.estimatedCost - measured.amount) / measured.amount
-        const sign = delta >= 0 ? '+' : ''
-        rows.push(`估算消耗    ${moneyFine(usage.estimatedCost, cfg.priceSymbol)}   （偏差 ${sign}${(delta * 100).toFixed(1)}%）`)
-      } else {
-        rows.push(`估算消耗    ${moneyFine(usage.estimatedCost, cfg.priceSymbol)}   （币种与余额不同，不做偏差对比）`)
-      }
-    }
-  } else if (cfg.showEstimate) {
-    rows.push(`估算消耗    ${moneyFine(usage.estimatedCost, cfg.priceSymbol)}   （拿不到余额差额，只有估算）`)
-  }
+  // 会话花费只有估算这一个口径：余额差额是账户级的，别的会话花掉的钱同样会从
+  // 差额里掉下来，算不到本会话头上。进度条每满一轮就归零，所以这里把本轮位置
+  // 和已经走满的轮数一并写出来 —— 横条上只能看到前者。
+  const { percent, completed } = spendCycle(usage.estimatedCost, CYCLE_BUDGET)
+  rows.push(
+    `本会话估算  ${moneyFine(usage.estimatedCost, cfg.priceSymbol)}   （进度条 ${percent.toFixed(1)}%，已走满 ${completed} 轮 ×${cfg.priceSymbol}${CYCLE_BUDGET}）`,
+  )
 
   const hitRate = cacheHitRate(usage)
   rows.push(
@@ -419,7 +377,7 @@ export const register: Register = (on, options) => {
     })
     await $.command.register({
       name: 'deepseek-cost',
-      description: '列出本会话用量明细，并把估算值和余额差额实测值对照',
+      description: '列出本会话用量明细与按单价折算出来的花费',
     })
     await $.command.register({
       name: 'deepseek-refresh',
@@ -431,7 +389,7 @@ export const register: Register = (on, options) => {
       argumentHint: 'sk-...',
     })
 
-    // 3) 拉一次真实余额（有缓存也拉，让数字尽快变准），顺带立下实测基准
+    // 3) 拉一次真实余额（有缓存也拉，让数字尽快变准）
     await refreshBalance($, cfg)
 
     // 4) 起定时刷新。定时器归引擎的时钟管，钩子这一趟结束也照样跑，
@@ -574,23 +532,13 @@ export const register: Register = (on, options) => {
       )
     }
 
-    // 本会话用量：token 是真实计数；钱优先给余额差额的实测值，
-    // 估算值作为对照跟在括号里，好让人一眼看出估算准不准。
+    // 本会话用量：token 是逐轮上报的真实计数，花费是按单价折算出来的估算值。
     let usageNode: RenderElement | null = null
     if (cfg.showUsage && usage.turns > 0) {
-      const measured = measuredSpend(usage, balance)
-      let tail: string
-      if (measured) {
-        tail = `实测${money(measured.amount, currencySymbol(measured.currency))}`
-        if (cfg.showEstimate && usage.estimatedCost > 0) {
-          tail += `(估${money(usage.estimatedCost, cfg.priceSymbol)})`
-        }
-      } else {
-        tail = `≈${money(usage.estimatedCost, cfg.priceSymbol)}`
-      }
       usageNode = (
         <Text key="usage" dimColor>
-          ↑{compact(usage.inputTokens)} ↓{compact(usage.outputTokens)} {tail}
+          ↑{compact(usage.inputTokens)} ↓{compact(usage.outputTokens)}{' '}
+          ≈{money(usage.estimatedCost, cfg.priceSymbol)}
         </Text>
       )
     }
