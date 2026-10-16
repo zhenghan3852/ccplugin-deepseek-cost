@@ -49,6 +49,44 @@ export type Usage = {
 /** 上一次刷新失败的原因；`null` 表示正常。 */
 export type HudError = string | null
 
+// ── 抽奖 ────────────────────────────────────────────────────────────
+
+/** 五个档位，从高概率到低概率。 */
+export type TierId = 'common' | 'rare' | 'uncommon' | 'epic' | 'legendary'
+
+/**
+ * 抽奖的全局账本，存在 `$.store` 里 —— 所以它跨会话、跨热重载共享：
+ * 任意会话里花掉的 token 攒下的次数，都能在任意会话里抽。
+ *
+ * 注意 `$.store` 没有 CAS（只有 `$.state` 有 `ifVersion`），所以这里是
+ * 读-改-写、最后写入者胜出。写入方只有「每轮自动累加」和「用户手动抽一次」
+ * 两类，都是人速节奏，撞在同一毫秒的概率可以忽略。
+ */
+export type GachaRecord = {
+  /** 全局累计的估算花费（元），逐轮累加 */
+  spent: number
+  /** 已经抽过多少次 */
+  drawn: number
+  /** 物品 id → 抽到过几次 */
+  owned: Record<string, number>
+}
+
+/**
+ * 一次开奖的过程状态，只活在 `$.state` 里，给面板渲染用。
+ * 持久的东西在 `GachaRecord`，这里只放"这一次开奖演到哪了"。
+ */
+export type Spin = {
+  phase: 'idle' | 'spinning' | 'revealed'
+  /** 本次抽到的档位 */
+  tier: TierId | null
+  /** 本次抽到的物品 id */
+  itemId: string | null
+  /** 动画帧序号 */
+  frame: number
+  /** 抽完这一次之后还剩几次 —— 面板上"再来一次"按钮要用，避免每帧去读 store */
+  pending: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'deepseek-cost-hud': {
@@ -61,6 +99,8 @@ declare module 'claude-code' {
        * 非 DeepSeek 的模型既不计价也不显示横条。
        */
       model: string
+      /** 抽奖动画的当前状态 */
+      spin: Spin
     }
   }
 }

@@ -40,7 +40,9 @@ import type {
   RenderNode,
 } from 'claude-code'
 
-import type { Balance, HudError, Usage } from '../types'
+import type { Balance, GachaRecord, HudError, Spin, TierId, Usage } from '../types'
+import { ITEM_BY_ID, ITEMS, ITEMS_BY_TIER, rollItem, TIER_BY_ID, TIERS } from './gacha-items'
+import { encodeRow, wheelGrid, WHEEL_FRAMES, WHEEL_TICK_MS } from './gacha-wheel'
 
 // ── 状态引用 ────────────────────────────────────────────────────────
 // plugin / key 必须是源码里的字面量，`claude plugin validate` 会把它们
@@ -210,15 +212,10 @@ function renderBar(percent: number, width = 10): string {
 /** 进度条每走满这么多就归零重来，单位与 priceCurrency 一致。 */
 const CYCLE_BUDGET = 1
 
-/**
- * 本会话估算花费在**当前这一轮**里的位置。
- * `completed` 是已经走满的轮数，横条上以 ×N 标出来 —— 因为进度条本身
- * 每满一轮就重置，不标的话看不出这是第几轮。
- */
-function spendCycle(cost: number, budget: number): { percent: number; completed: number } {
-  if (!(budget > 0)) return { percent: 0, completed: 0 }
-  const completed = Math.floor(cost / budget)
-  return { percent: ((cost - completed * budget) / budget) * 100, completed }
+/** 本会话估算花费在当前这一元里的位置（百分比）。每满一轮归零，所以只看余数。 */
+function cyclePercent(cost: number, budget: number): number {
+  if (!(budget > 0)) return 0
+  return ((cost % budget) / budget) * 100
 }
 
 /** 余额越低越危险 */
@@ -375,11 +372,10 @@ async function costReport($: EngineInterface, cfg: Settings): Promise<string> {
   }
 
   // 会话花费只有估算这一个口径：余额差额是账户级的，别的会话花掉的钱同样会从
-  // 差额里掉下来，算不到本会话头上。进度条每满一轮就归零，所以这里把本轮位置
-  // 和已经走满的轮数一并写出来 —— 横条上只能看到前者。
-  const { percent, completed } = spendCycle(usage.estimatedCost, CYCLE_BUDGET)
+  // 差额里掉下来，算不到本会话头上。
+  const percent = cyclePercent(usage.estimatedCost, CYCLE_BUDGET)
   rows.push(
-    `本会话估算  ${moneyFine(usage.estimatedCost, cfg.priceSymbol)}   （进度条 ${percent.toFixed(1)}%，已走满 ${completed} 轮 ×${cfg.priceSymbol}${CYCLE_BUDGET}）`,
+    `本会话估算  ${moneyFine(usage.estimatedCost, cfg.priceSymbol)}   （进度条 ${percent.toFixed(1)}%，每满 ${cfg.priceSymbol}${CYCLE_BUDGET} 得一次抽奖）`,
   )
 
   const hitRate = cacheHitRate(usage)
@@ -392,6 +388,132 @@ async function costReport($: EngineInterface, cfg: Settings): Promise<string> {
   rows.push(`当前计价    ${isPeak(Date.now()) ? '高峰' : `错峰（高峰价的 ${(cfg.offPeakRatio * 100).toFixed(0)}%）`}`)
 
   return rows.join('\n')
+}
+
+// ── 抽奖与图鉴 ──────────────────────────────────────────────────────
+//
+// 次数与图鉴存在 `$.store` 里，所以跨会话共享 —— 任意会话里花掉的 token 攒下
+// 的次数，都能在任意会话里抽。开奖的**过程**状态才放 `$.state`。
+
+const EMPTY_SPIN: Spin = { phase: 'idle', tier: null, itemId: null, frame: 0, pending: 0 }
+
+const spinAtom = atom({ plugin: 'deepseek-cost-hud', key: 'spin' } as const, EMPTY_SPIN)
+
+/** 读全局账本。形状不对就当空账本 —— 它跨版本持久化，不能假定一定合法。 */
+async function readGacha($: EngineInterface): Promise<GachaRecord> {
+  const raw = (await $.store.get('gacha')) as Partial<GachaRecord> | undefined
+  return {
+    spent: typeof raw?.spent === 'number' && Number.isFinite(raw.spent) ? raw.spent : 0,
+    drawn: typeof raw?.drawn === 'number' && Number.isFinite(raw.drawn) ? raw.drawn : 0,
+    owned: raw?.owned && typeof raw.owned === 'object' ? { ...raw.owned } : {},
+  }
+}
+
+/** 每满 ¥1 一次，减掉已经抽掉的。 */
+function pendingDraws(record: GachaRecord): number {
+  return Math.max(0, Math.floor(record.spent) - record.drawn)
+}
+
+/** 某一档已收集的物品，排成一行。 */
+function ownedLine(record: GachaRecord, tier: TierId): string {
+  return ITEMS_BY_TIER[tier]
+    .filter((item) => (record.owned[item.id] ?? 0) > 0)
+    .map((item) => `${item.name}×${record.owned[item.id] ?? 1}`)
+    .join('  ')
+}
+
+/** `/deepseek-dex` 的正文：各档收集进度 + 已抽到的物品。 */
+function dexLines(record: GachaRecord): string[] {
+  const collected = ITEMS.filter((item) => (record.owned[item.id] ?? 0) > 0).length
+  const rows = [
+    `待抽        ${pendingDraws(record)} 次   （累计花费 ¥${record.spent.toFixed(2)}，每满 ¥1 得一次）`,
+    `已抽        ${record.drawn} 次，图鉴 ${collected}/${ITEMS.length}`,
+    '',
+  ]
+  for (const tier of TIERS) {
+    const pool = ITEMS_BY_TIER[tier.id]
+    const owned = pool.filter((item) => (record.owned[item.id] ?? 0) > 0)
+    rows.push(`${tier.name}（${tier.value}）  ${owned.length}/${pool.length}`)
+    if (owned.length > 0) rows.push(`  ${ownedLine(record, tier.id)}`)
+  }
+  return rows
+}
+
+// ── 像素转盘 ────────────────────────────────────────────────────────
+//
+// 几何与配色在 gacha-wheel.ts（纯函数，可单测），这里只管把它接上界面和时钟。
+// 画法上有一点是硬约束：引擎的渲染元素里只有 Box/Text 在终端和 Desktop 上
+// **都**支持 backgroundColor，所以转盘只能用它们拼 —— Raster 只有终端、
+// Svg 只有 Desktop，单实现都用不了。
+
+const GACHA_PANE = 'deepseek-gacha'
+
+let spinTimer: { cancel: () => void } | null = null
+
+/** 推进一帧；走完就停在开奖态并停表。 */
+async function advanceSpin($: EngineInterface): Promise<void> {
+  const spin = await read($, spinAtom)
+  if (spin.phase !== 'spinning') return
+  const frame = spin.frame + 1
+  if (frame >= WHEEL_FRAMES) {
+    spinTimer?.cancel()
+    spinTimer = null
+    await update(
+      $,
+      spinAtom,
+      (prev): Spin => ({ ...prev, phase: 'revealed', frame: WHEEL_FRAMES - 1 }),
+    )
+  } else {
+    await update($, spinAtom, (prev): Spin => ({ ...prev, frame }))
+  }
+}
+
+/**
+ * 抽一次并起动画；返回交给命令说的那一句话。
+ *
+ * **先定结果、先落库，再谈动画**：面板放不下或动画播不出来，次数照样扣了、
+ * 东西照样到手了 —— 画面只是表现层，不参与决定。
+ */
+async function startDraw($: EngineInterface): Promise<string> {
+  const record = await readGacha($)
+  const pending = pendingDraws(record)
+
+  if (pending <= 0) {
+    return `还没有可抽的次数：累计花费 ¥${record.spent.toFixed(2)}，每满 ¥1 得一次。`
+  }
+
+  const { tier, item } = rollItem(Math.random)
+  await $.store.set('gacha', {
+    spent: record.spent,
+    drawn: record.drawn + 1,
+    owned: { ...record.owned, [item.id]: (record.owned[item.id] ?? 0) + 1 },
+  })
+
+  await update($, spinAtom, () => ({
+    phase: 'spinning' as const,
+    tier,
+    itemId: item.id,
+    frame: 0,
+    pending: pending - 1,
+  }))
+
+  const headline = `${TIER_BY_ID[tier].name} · ${item.name}`
+  const opened = await $.ui.open({
+    id: GACHA_PANE,
+    title: '抽奖',
+    focus: true,
+    closeOnEscape: true,
+  })
+
+  if (!opened.isPlaced) {
+    // 终端太窄之类：面板没地方放，就不演了，直接把结果说出来
+    await update($, spinAtom, (prev): Spin => ({ ...prev, phase: 'revealed' }))
+    return `抽到了：${headline}（面板放不下，没播动画）`
+  }
+
+  spinTimer?.cancel()
+  spinTimer = $.clock.every(WHEEL_TICK_MS, () => void advanceSpin($))
+  return `抽到了：${headline}`
 }
 
 export const register: Register = (on, options) => {
@@ -429,6 +551,14 @@ export const register: Register = (on, options) => {
       name: 'deepseek-key',
       description: '保存 DeepSeek API Key（存进插件存储）',
       argumentHint: 'sk-...',
+    })
+    await $.command.register({
+      name: 'deepseek-draw',
+      description: '用攒下的次数抽一次奖（每花满 ¥1 得一次）',
+    })
+    await $.command.register({
+      name: 'deepseek-dex',
+      description: '看抽奖图鉴：各档收集进度与已抽到的物品',
     })
 
     // 3) 拉一次真实余额（有缓存也拉，让数字尽快变准），再看清用的是哪个模型
@@ -487,6 +617,11 @@ export const register: Register = (on, options) => {
         }
         const turnCost = costOf(tokens, cfg, peakPricesFor(model, cfg), now)
 
+        // 这一轮的花费也累加进全局账本 —— 每满 ¥1 就多一次抽奖机会。
+        // 账本在 $.store（宿主级），所以任意会话花的钱攒的次数都能在任意会话里抽。
+        const gacha = await readGacha($)
+        await $.store.set('gacha', { ...gacha, spent: gacha.spent + turnCost })
+
         await update($, usageAtom, prev => ({
           ...prev,
           inputTokens: prev.inputTokens + tokens.inputTokens,
@@ -534,6 +669,15 @@ export const register: Register = (on, options) => {
     return { text: error ? `Key 已保存，但刷新失败：${shortError(error)}` : 'Key 已保存，余额已刷新。' }
   })
 
+  // ── 抽奖 ──────────────────────────────────────────────────────────
+
+  on('command.run', { command: 'deepseek-draw' }, async ($) => ({ text: await startDraw($) }))
+
+  on('command.run', { command: 'deepseek-dex' }, async ($) => {
+    const record = await readGacha($)
+    return { text: dexLines(record).join('\n') }
+  })
+
   // ── 横条本体 ──────────────────────────────────────────────────────
   // AbovePrompt 只在 terminal 和 desktop 两个 surface 上拉起，所以这一个钩子
   // 就是「同时应用到 CLI 和 Desktop」的那一处。
@@ -567,11 +711,11 @@ export const register: Register = (on, options) => {
       )
     }
 
-    // 本会话估算花费的进度条。它量的是当前这一元里已经花了多少，每满 ¥1 就
-    // 归零重来，所以后面的 ×N 是必要的 —— 它就是已经花掉的整元数。
+    // 本会话估算花费的进度条：每满 ¥1 归零重来。走满的每一元换来一次抽奖
+    // 机会，但次数只在命令里显示，所以这里不再标 ×N。
     let cycleNode: RenderElement | null = null
     if (cfg.showCycle) {
-      const { percent, completed } = spendCycle(usage.estimatedCost, CYCLE_BUDGET)
+      const percent = cyclePercent(usage.estimatedCost, CYCLE_BUDGET)
       cycleNode = (
         <Text key="cycle">
           {renderBar(percent)} {percent.toFixed(1)}%
@@ -579,7 +723,6 @@ export const register: Register = (on, options) => {
             {' '}
             {cfg.priceSymbol}
             {CYCLE_BUDGET}
-            {completed > 0 ? ` ×${completed}` : ''}
           </Text>
         </Text>
       )
@@ -611,6 +754,62 @@ export const register: Register = (on, options) => {
         </Text>
         {children}
         <Button key="toggle" label="隐藏" plain onPress={() => void update($, hiddenAtom, () => true)} />
+      </Box>
+    )
+  })
+
+  // ── 抽奖面板 ──────────────────────────────────────────────────────
+  // Pane 站点在终端、Desktop、VS Code 上都渲染，所以转盘只写这一份。
+
+  on('ui.render', { component: 'Pane' }, async ($, e, next) => {
+    if (e.requestId !== GACHA_PANE) return next(e)
+
+    const spin = await read($, spinAtom)
+    if (spin.phase === 'idle' || !spin.tier) return next(e)
+
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const tier = TIER_BY_ID[spin.tier]
+    const item = spin.itemId ? ITEM_BY_ID[spin.itemId] : undefined
+    const revealed = spin.phase === 'revealed'
+
+    const wheel = wheelGrid(spin.tier, revealed ? WHEEL_FRAMES - 1 : spin.frame).map((cells, y) => (
+      <Box key={`row${y}`} flexDirection="row">
+        {encodeRow(cells).map((run, x) =>
+          run.color === null ? (
+            <Text key={`cell${x}`}>{' '.repeat(run.width)}</Text>
+          ) : (
+            <Text key={`cell${x}`} backgroundColor={run.color}>
+              {' '.repeat(run.width)}
+            </Text>
+          ),
+        )}
+      </Box>
+    ))
+
+    return (
+      <Box flexDirection="column">
+        {wheel}
+        {revealed && item ? (
+          <Box flexDirection="row" gap={1}>
+            <Text bold color={tier.color}>
+              {tier.name}
+            </Text>
+            <Text>{item.name}</Text>
+            <Text dimColor>{tier.value}</Text>
+          </Box>
+        ) : (
+          <Text dimColor>转动中…</Text>
+        )}
+        <Box flexDirection="row" gap={1}>
+          {revealed && spin.pending > 0 ? (
+            <Button
+              key="again"
+              label={`再来一次（还剩 ${spin.pending} 次）`}
+              onPress={() => void startDraw($)}
+            />
+          ) : null}
+          <Button key="close" label="关闭" onPress={() => void $.ui.close({ id: GACHA_PANE })} />
+        </Box>
       </Box>
     )
   })

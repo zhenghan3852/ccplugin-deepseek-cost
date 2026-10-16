@@ -1,7 +1,7 @@
 {
   "name": "deepseek-cost-hud",
   "displayName": "DeepSeek Cost HUD",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "DeepSeek 余额与用量 HUD —— 同时绘制在 Claude Code 终端与 Claude Desktop 输入框上方",
   "author": {
     "name": "zhenghan3852",

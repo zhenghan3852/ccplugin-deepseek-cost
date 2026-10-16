@@ -13,10 +13,14 @@
  */
 
 import type { On } from 'claude-code'
-import type { Engine } from 'claude-code/testing'
+import type { Engine, MockClock } from 'claude-code/testing'
 import { expect, mock, test } from 'claude-code/testing'
 
+import { ITEMS, ITEMS_BY_TIER, rollItem, TIERS } from './gacha-items'
+import { finalRotation, wheelGrid, WHEEL_FRAMES, WHEEL_SIZE, WHEEL_TICK_MS } from './gacha-wheel'
+
 const PLUGIN = 'deepseek-cost-hud'
+const GACHA_PANE = 'deepseek-gacha'
 
 /** 固定一份 /user/balance 的响应体，免得测试真的联网。 */
 const BALANCE_BODY = JSON.stringify({
@@ -64,11 +68,40 @@ function stubEngine(on: On, model = 'deepseek-flash'): void {
 }
 
 /** 备齐一次会话开始所需的答案，再真的触发 session.start。 */
-async function startSession($: Engine, on: On): Promise<void> {
-  mock.clock(on)
-  mock.store(on)
+async function startSession($: Engine, on: On, seedStore?: () => void): Promise<MockClock> {
+  const clock = mock.clock(on)
+  // seedStore 用来换掉内置的 store 替身：`mock.store` 不回显写进去的东西，
+  // 想在抽奖后检查账本，测试得自己拿一个 Map 接住读写
+  if (seedStore) seedStore()
+  else mock.store(on)
   on('session.start', () => ({ cwd: '/tmp/hud' }))
   await $.session.start({ cwd: '/tmp/hud', surface: 'terminal', isInteractive: true })
+  return clock
+}
+
+/** 跑一条插件注册的命令。本版本的 `command.run` 要 origin 与 presentation。 */
+function runCommand($: Engine, command: string): Promise<{ text?: string }> {
+  return $.command.run({
+    command,
+    args: '',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: false, columns: 80 },
+  })
+}
+
+/** 假的全局账本：读改写都落在同一个 Map 上，测试能直接查。 */
+function fakeStore(entries: Record<string, unknown> = {}) {
+  const saved = new Map<string, unknown>(Object.entries(entries))
+  return {
+    saved,
+    stub(on: On): void {
+      on('store.get', ($, e) => ({ value: saved.get(e.key) }))
+      on('store.set', ($, e) => {
+        saved.set(e.key, e.value)
+        return { value: undefined }
+      })
+    },
+  }
 }
 
 /** 一条走完的轮次，带真实形状的 usage。 */
@@ -193,9 +226,10 @@ test('花费进度条走满一轮就归零，并标出已经走满的轮数', as
   })
 
   // find 不认 key（键不在挂载出来的 props 里），所以按文本断言整条横条
-  const band = await ui.find({ text: /×1/ })
-  expect(band?.text).toMatch(/5\.0%/)
-  expect(band?.text).toMatch(/¥1 ×1/)
+  const band = await ui.find({ text: /5\.0% ¥1/ })
+  expect(band).toBeDefined()
+  // ×N 已按需求取消：横条上不该再出现乘号
+  expect(band?.text).not.toMatch(/×/)
 })
 
 test('非 DeepSeek 模型时整条横条都不画，那一轮也不进账', async ($, on) => {
@@ -225,4 +259,188 @@ test('非 DeepSeek 模型时整条横条都不画，那一轮也不进账', asyn
   })
   expect(report.text).toContain('非 DeepSeek 模型')
   expect(report.text).toContain('还没有走完一轮')
+})
+
+// ── 抽奖 ────────────────────────────────────────────────────────────
+
+/** 按顺序吐出固定值的假随机源；用完后一直返回最后一个。 */
+function sequence(values: readonly number[]): () => number {
+  let index = 0
+  return () => values[Math.min(index++, values.length - 1)] ?? 0
+}
+
+/** 面板的 props，按 Pane 站点声明的字段填齐。 */
+const PANE_PROPS = {
+  title: '抽奖',
+  isFocused: true,
+  bodyColumns: 60,
+  placement: 'inline' as const,
+  scroll: { offset: 0, bodyRows: 14 },
+  view: {},
+}
+
+test('物品表：5 档 100 件，概率之和为 1', () => {
+  expect(ITEMS.length).toBe(100)
+  expect(TIERS.map((t) => ITEMS_BY_TIER[t.id].length)).toEqual([70, 15, 8, 5, 2])
+  expect(new Set(ITEMS.map((i) => i.id)).size).toBe(100)
+  // 浮点求和有末位误差，放大到百万分之一再比
+  expect(Math.round(TIERS.reduce((acc, t) => acc + t.chance, 0) * 1e6)).toBe(1_000_000)
+})
+
+test('rollItem：先按档位概率定档，再在档内等概率取件', () => {
+  // 第二次取值固定在 0，拿到的总是该档第一件
+  const tierAt = (roll: number) => rollItem(sequence([roll, 0])).tier
+
+  expect(tierAt(0)).toBe('common')
+  expect(tierAt(0.85)).toBe('rare') // 累加区间 0.79923 ~ 0.95908
+  expect(tierAt(0.99)).toBe('uncommon') // 0.95908 ~ 0.99105
+  expect(tierAt(0.995)).toBe('epic') // 0.99105 ~ 0.99744
+  expect(tierAt(0.999)).toBe('legendary') // 0.99744 ~ 1
+
+  // 档内均匀：0 拿第一件，接近 1 拿最后一件
+  const common = ITEMS_BY_TIER.common
+  expect(rollItem(sequence([0, 0])).item).toEqual(common[0])
+  expect(rollItem(sequence([0, 0.9999])).item).toEqual(common[common.length - 1])
+})
+
+test('终帧的指针一定停在抽中的那一档上', () => {
+  // 指针在正上方 = 第 0 行、正中那一列。这是整个动画的核心不变量：
+  // 结果先定、角度反推，所以转盘停下的位置永远是真实结果。
+  const middle = (WHEEL_SIZE - 1) / 2
+  for (const tier of TIERS) {
+    expect(wheelGrid(tier.id, WHEEL_FRAMES - 1)[0]?.[middle]).toBe(tier.color)
+  }
+})
+
+test('转盘是个圆环：中心和四角留空，环上有颜色', () => {
+  const grid = wheelGrid('common', 0)
+  const middle = (WHEEL_SIZE - 1) / 2
+  expect(grid[middle]?.[middle]).toBeNull()
+  expect(grid[0]?.[0]).toBeNull()
+  expect(grid[0]?.[middle]).not.toBeNull()
+  // 转起来了：同一档不同帧画面不该一样
+  expect(wheelGrid('common', 20)).not.toEqual(wheelGrid('common', 0))
+})
+
+test('抽奖：扣一次次数、记进图鉴、开出面板', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
+  stubBalance(on)
+  let openCalls = 0
+  on('ui.open', () => {
+    openCalls += 1
+    return { value: { isPlaced: true } }
+  })
+  const store = fakeStore({ gacha: { spent: 3, drawn: 0, owned: {} } })
+  await startSession($, on, () => store.stub(on))
+
+  const answer = await runCommand($, 'deepseek-draw')
+  expect(answer.text).toMatch(/^抽到了：/)
+  expect(openCalls).toBe(1)
+
+  const record = store.saved.get('gacha') as { drawn: number; owned: Record<string, number> }
+  expect(record.drawn).toBe(1)
+  expect(Object.values(record.owned)).toEqual([1])
+})
+
+test('面板放不下时照样开奖，只是不播动画', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
+  stubBalance(on)
+  on('ui.open', () => ({ value: { isPlaced: false, reason: '终端太窄' } }))
+  const store = fakeStore({ gacha: { spent: 1, drawn: 0, owned: {} } })
+  await startSession($, on, () => store.stub(on))
+
+  const answer = await runCommand($, 'deepseek-draw')
+  // 次数照扣、东西照到手 —— 动画只是表现层
+  expect(answer.text).toContain('没播动画')
+  expect((store.saved.get('gacha') as { drawn: number }).drawn).toBe(1)
+})
+
+test('没有可抽次数时不抽，也不开面板', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
+  stubBalance(on)
+  let openCalls = 0
+  on('ui.open', () => {
+    openCalls += 1
+    return { value: { isPlaced: true } }
+  })
+  const store = fakeStore({ gacha: { spent: 0, drawn: 0, owned: {} } })
+  await startSession($, on, () => store.stub(on))
+
+  const answer = await runCommand($, 'deepseek-draw')
+  expect(answer.text).toContain('还没有可抽的次数')
+  expect(openCalls).toBe(0)
+  expect((store.saved.get('gacha') as { drawn: number }).drawn).toBe(0)
+})
+
+test('转盘逐帧推进，走完停在开奖态', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
+  stubBalance(on)
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  const store = fakeStore({ gacha: { spent: 2, drawn: 0, owned: {} } })
+  const clock = await startSession($, on, () => store.stub(on))
+
+  await runCommand($, 'deepseek-draw')
+
+  const pane = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: GACHA_PANE,
+    viewport: { columns: 100, rows: 30 },
+    props: PANE_PROPS,
+  })
+  expect(await pane.find({ text: '转动中…' })).toBeDefined()
+
+  // 帧数走完（时钟是 mock 的，推进多少就是多少）
+  await clock.advance(WHEEL_TICK_MS * WHEEL_FRAMES)
+  await pane.redraw()
+
+  expect(await pane.find({ text: '转动中…' })).toBeUndefined()
+  expect(await pane.find({ text: /普通|稀有|罕见|史诗|传说/ })).toBeDefined()
+})
+
+test('图鉴：给出待抽次数与各档收集进度', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
+  stubBalance(on)
+  const store = fakeStore({
+    gacha: { spent: 5, drawn: 2, owned: { tissue: 1, 'milk-tea': 1 } },
+  })
+  await startSession($, on, () => store.stub(on))
+
+  const answer = await runCommand($, 'deepseek-dex')
+  expect(answer.text).toContain('3 次') // floor(5) - 2
+  expect(answer.text).toContain('图鉴 2/100')
+  expect(answer.text).toContain('普通（≈¥1）  1/70')
+  expect(answer.text).toContain('一包抽纸×1')
+  expect(answer.text).toContain('稀有（≈¥5）  1/15')
+  expect(answer.text).toContain('一杯奶茶×1')
+})
+
+test('每走完一轮就多一次抽奖机会，次数记在全局账本上', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
+  stubBalance(on)
+  on('turn.complete', () => ({ text: '' }))
+  const store = fakeStore({ gacha: { spent: 0, drawn: 0, owned: {} } })
+  await startSession($, on, () => store.stub(on))
+
+  // 错峰下 26.25 万输出 token × ¥8/M × 50% = ¥1.05 —— 刚好攒满一次
+  await $.turn.complete({
+    ...TURN,
+    usage: {
+      ...TURN.usage,
+      input_tokens: 0,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      output_tokens: 262_500,
+    },
+  })
+
+  const record = store.saved.get('gacha') as { spent: number }
+  expect(Math.round(record.spent * 100) / 100).toBe(1.05)
 })
