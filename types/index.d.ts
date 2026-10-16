@@ -108,6 +108,8 @@ declare module 'claude-code' {
       model: string
       /** 抽奖动画的当前状态 */
       spin: Spin
+      /** 设置 Key 的面板上那行提示（空串 = 还没提交过） */
+      keyMsg: string
     }
   }
 }

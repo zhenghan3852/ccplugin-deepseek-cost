@@ -116,44 +116,47 @@ claude --plugin-dir .
 
 ## 配置 API Key
 
-**先说结论：桌面端没有配置界面，必须开一次终端跑一条命令。** 这是平台的限制，不是插件的缺陷 —— 已查证：
+三种方式，按推荐顺序。
 
-| 事实 | 依据 |
-|---|---|
-| 插件只能画在**会话内** | 引擎的渲染站点一共 15 个，全在会话里（`AbovePrompt`/`Pane`/`CommandOutput`…），没有一个是应用设置窗口 |
-| 桌面端 Settings → Plugins 的插件页只显示 `description` 和它**自己枚举**的组件（Skills / Commands / Connectors / Hooks / Agents） | 那些标签来自插件**静态声明的文件**（`skills/`、`commands/`、`.mcp.json`…）；本插件的命令是运行时注册的，所以那页只有一个 Overview |
-| 应用代码里搜 `Configure options` 是 **0 次**（而 `Update now`、`Uninstall` 都在） | 引擎文档里那个配置对话框只存在于**终端的 `/plugin` 面板**，Electron 应用里没有实现 |
+### 1. 在会话里一条命令：`/deepseek-key`（推荐，桌面端也能用）
 
-### 可靠做法：开一个终端，一条命令
+```
+/deepseek-key
+```
+
+开一个面板，粘贴 Key 回车 —— 值写进 **macOS 钥匙串**：**永久有效、不是明文、不进会话记录**（在面板里输入，不经过提示符，也不会被记进 transcript）。
+
+> **为什么绕这么一圈**：mods API 里**没有**任何一条能写系统凭据库 —— `$.store` 是明文 JSON、`$.fs` 是明文文件、`$.env.set` 只作用于进程。而引擎自己那套会写钥匙串的 userConfig 表单，只存在于**终端版 Claude Code 的 `/plugin` 面板**里；桌面端没有终端 UI，插件也画不进应用的设置窗口。所以插件只能借 macOS 自带的 `security` 命令自己存取钥匙串。
+>
+> **代价如实说**：**仅 macOS**（非 macOS 上这条命令会报失败，请用下面第 2、3 种）；写入的那一瞬，key 会作为参数出现在进程列表里 —— 只有同一用户能看到，窗口极短。
+>
+> 注意这是插件自己的钥匙串条目（服务名 `deepseek-cost-hud`），不是引擎的配置，所以 `/plugin` 的 Configure options 里看不到它。
+
+### 2. 终端里一条命令（写进引擎自己的凭据库）
+
+桌面版自带 Claude Code，不需要另装 CLI：
 
 ```bash
-echo '{"apiKey":"sk-xxxxxxxxxxxxxxxx"}' | claude plugin configure deepseek-cost-hud@ccplugin-deepseek-cost --values-stdin
+CLI=$(ls ~/Library/Application\ Support/Claude*/claude-code/*/*/claude.app/Contents/MacOS/claude | tail -1)
+read -s KEY; echo; printf '{"apiKey":"%s"}' "$KEY" | "$CLI" plugin configure deepseek-cost-hud@ccplugin-deepseek-cost --values-stdin; unset KEY
 ```
 
-或者交互式（会列出所有选项）：`claude plugin configure deepseek-cost-hud@ccplugin-deepseek-cost`
+`read -s` 让 key 输入时不显示、也**不进 shell 历史**；值经 **stdin** 进引擎，写进钥匙串。终端版 Claude Code 用户还可以直接用 `/plugin` → **Installed** → **Configure options** 那个表单。
 
-值写进**系统凭据库**（macOS 钥匙串）：不落 `settings.json`、不进会话记录。**配置按用户存**，所以终端配一次，桌面端的会话也读得到 —— 一次配好，永久生效。
+### 3. 环境变量（兜底）
 
-### 没有终端可用时
+| 变量 | 说明 |
+|---|---|
+| `DEEPSEEK_API_KEY` | 最省事的无界面方案。注意**桌面版从 Finder 启动时不继承 shell 环境**，所以它对终端会话更有效；桌面端要持久就用 `~/.claude/settings.json` 的 `env` 块（明文） |
+| `ANTHROPIC_AUTH_TOKEN` | ⚠️ 只在里面放的是**真的 DeepSeek API Key** 时才有用。走 cc-switch 之类**代理模式**时那里是本地代理令牌（`ccs-...`），打官方接口必然 401 |
 
-给 `~/.claude/settings.json` 加一个 `env` 块：
+### 查找顺序
 
-```json
-{
-  "env": { "DEEPSEEK_API_KEY": "sk-xxxxxxxxxxxxxxxx" }
-}
+```
+插件配置 apiKey  →  钥匙串（/deepseek-key 存的）  →  DEEPSEEK_API_KEY  →  ANTHROPIC_AUTH_TOKEN
 ```
 
-Claude Code 会把它注入每个会话，插件经 `$.env.get` 读到。代价是**明文**（权限取决于文件本身），所以能用上面那条命令就别用这条。
-
-### 两条回退（按优先级）
-
-2. `DEEPSEEK_API_KEY` 环境变量 —— 注意**桌面版从 Finder 启动时不继承 shell 环境**，所以这条主要对终端会话有效；桌面端要持久就用上面那个 `env` 块。
-3. `ANTHROPIC_AUTH_TOKEN` —— ⚠️ 只在里面放的是**真的 DeepSeek API Key** 时才有用。走 cc-switch 之类的**代理模式**时，那里放的是本地代理令牌（形如 `ccs-...`），拿去打官方接口只会得到 401。
-
-> **历史**：早先有个 `/deepseek-key` 命令，把 key 明文写进插件自己的 store JSON，还会因为你把 key 敲在提示符里而**留在会话记录中** —— 已删除。也试过在会话内面板里收 key，但 `$.env.set` 只作用于进程、重启就没了，不够用，同样删掉了。key 只该进系统凭据库。
-
----
+钥匙串那份每个会话只查一次（不会每 60 秒去起进程）。
 
 ## 命令
 
@@ -164,6 +167,7 @@ Claude Code 会把它注入每个会话，插件经 `$.env.get` 读到。代价�
 | `/deepseek-refresh` | 立刻刷新余额 |
 | `/deepseek-draw` | 用攒下的次数抽一次奖（像素转盘） |
 | `/deepseek-dex` | 看抽奖图鉴：各档收集进度与已抽到的物品 |
+| `/deepseek-key` | 设置 DeepSeek API Key（写进 macOS 钥匙串，永久且非明文） |
 
 `/deepseek-cost` 的样子：
 
@@ -237,7 +241,7 @@ token       ↑125.3k（缓存命中 15.7M / 未命中 125.3k）  ↓54.4k   共
 
 | 想改什么 | 怎么改 |
 |---|---|
-| **API Key** | `claude plugin configure deepseek-cost-hud@ccplugin-deepseek-cost --values-stdin` —— 值进系统凭据库 |
+| **API Key** | 会话里 `/deepseek-key`（推荐，桌面端也能用）；或终端里 `claude plugin configure … --values-stdin`。两条都不落明文 |
 | 其它任何一项（开关、单价、币种…） | 同一条命令（`--values-stdin` 传 `{"priceOutput": 9}` 这样的 JSON），或终端会话里的 `/plugin` → **Installed** 标签 → **Configure options** |
 | 不想用命令 | 手改 `~/.claude/settings.json` 的 `pluginConfigs`，键是**插件 id**：`"deepseek-cost-hud@ccplugin-deepseek-cost": { "options": { "showCycle": false } }`。**敏感值不要走这里** —— 引擎只从系统凭据库读敏感值 |
 

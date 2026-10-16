@@ -266,14 +266,107 @@ function cacheHitRate(usage: Usage): number | null {
 let timer: { cancel: () => void } | null = null
 let isFetching = false
 
+// ── API Key：存进 macOS 钥匙串 ───────────────────────────────────────
+//
+// mods API 里**没有任何一条能写系统凭据库**：`$.store` 是明文 JSON、`$.fs` 是
+// 明文文件、`$.env.set` 只作用于进程。而引擎自己的 userConfig 流程（会把
+// sensitive 值写进钥匙串）在桌面端没有入口 —— 只有终端版 Claude Code 的
+// `/plugin` 面板里有。
+//
+// 所以想做到「一条指令 + 永久 + 非明文」，只能借 macOS 自带的 `security`。
+// 代价如实说：仅 macOS；写入那一瞬 key 会作为参数出现在进程列表里（只有同一
+// 用户看得到，窗口极短）。
+
+const KEY_PANE = 'deepseek-key'
+const KEYCHAIN_SERVICE = 'deepseek-cost-hud'
+const KEYCHAIN_ACCOUNT = 'apiKey'
+
+const keyMsgAtom = atom({ plugin: 'deepseek-cost-hud', key: 'keyMsg' } as const, '')
+
+/** 本进程里查过的钥匙串内容。`null` = 还没查过，所以只 spawn 一次。 */
+let keychainKey: string | null = null
+
+/** 从钥匙串读我们自己存的 key；读不到（含非 macOS）返回空串。 */
+async function readKeychainKey($: EngineInterface): Promise<string> {
+  try {
+    const out = await $.process.run([
+      'security',
+      'find-generic-password',
+      '-s',
+      KEYCHAIN_SERVICE,
+      '-a',
+      KEYCHAIN_ACCOUNT,
+      '-w',
+    ])
+    return out.exitCode === 0 ? out.stdout.trim() : ''
+  } catch {
+    return ''
+  }
+}
+
+/** 写进钥匙串（`-U` = 已存在就更新）。返回空串表示成功，否则是失败原因。 */
+async function writeKeychainKey($: EngineInterface, key: string): Promise<string> {
+  try {
+    const out = await $.process.run([
+      'security',
+      'add-generic-password',
+      '-U',
+      '-s',
+      KEYCHAIN_SERVICE,
+      '-a',
+      KEYCHAIN_ACCOUNT,
+      '-w',
+      key,
+    ])
+    if (out.exitCode !== 0) {
+      return (out.stderr.trim() || `security 退出码 ${out.exitCode}`).slice(0, 120)
+    }
+    keychainKey = key
+    return ''
+  } catch (err) {
+    return messageOf(err).slice(0, 120)
+  }
+}
+
+/** 面板里回车提交：存钥匙串 → 报告结果 → 成功就立刻拿新 key 刷余额。 */
+async function saveKey($: EngineInterface, cfg: Settings, typed: string): Promise<void> {
+  const key = typed.trim()
+  if (!key) return
+  const problem = await writeKeychainKey($, key)
+  await update($, keyMsgAtom, () =>
+    problem ? `没存进去：${problem}` : '已存入钥匙串 ✓ 这台机器上永久有效',
+  )
+  if (!problem) await refreshBalance($, cfg)
+  await $.ui.invalidate('ui.render')
+}
+
+/** 打开设置 Key 的面板；返回给命令说的那句话。 */
+async function openKeyPane($: EngineInterface): Promise<string> {
+  const opened = await $.ui.open({
+    id: KEY_PANE,
+    title: '设置 API Key',
+    focus: true,
+    closeOnEscape: true,
+    columns: 46,
+    rows: 12,
+  })
+  if (!opened.isPlaced) {
+    return '面板放不下。见 README 的「配置 API Key」—— 终端里跑 claude plugin configure 也行。'
+  }
+  await update($, keyMsgAtom, () => '')
+  return '在面板里粘贴 Key 后回车即存进钥匙串（不进会话记录、不是明文）。'
+}
+
 /**
- * 按优先级找 API Key：插件配置 → `DEEPSEEK_API_KEY` → `ANTHROPIC_AUTH_TOKEN`。
- *
- * 只有配置项那一条会把值存进系统凭据库 —— 另两条是环境变量回退，值本来就在
- * 环境里。所以**推荐用配置项**：它不像早期那样在磁盘上留一份明文。
+ * 按优先级找 API Key：插件配置 → **钥匙串** → `DEEPSEEK_API_KEY` →
+ * `ANTHROPIC_AUTH_TOKEN`。
  */
 async function resolveKey($: EngineInterface, cfg: Settings): Promise<string> {
   if (cfg.apiKey) return cfg.apiKey
+
+  // 钥匙串那份只在本进程里查一次 —— 不能每 60 秒去 spawn 一个进程
+  keychainKey ??= await readKeychainKey($)
+  if (keychainKey) return keychainKey
 
   const direct = await $.env.get('DEEPSEEK_API_KEY')
   if (direct?.trim()) return direct.trim()
@@ -621,6 +714,10 @@ export const register: Register = (on, options) => {
       name: 'deepseek-dex',
       description: '看抽奖图鉴：各档收集进度与已抽到的物品',
     })
+    await $.command.register({
+      name: 'deepseek-key',
+      description: '设置 DeepSeek API Key（存进 macOS 钥匙串，永久且非明文）',
+    })
 
     // 3) 拉一次真实余额（有缓存也拉，让数字尽快变准），再回放上次确认的模型
     await refreshBalance($, cfg)
@@ -727,6 +824,8 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'deepseek-draw' }, async ($) => ({ text: await startDraw($) }))
 
   on('command.run', { command: 'deepseek-dex' }, async ($) => ({ text: await openDexPane($) }))
+
+  on('command.run', { command: 'deepseek-key' }, async ($) => ({ text: await openKeyPane($) }))
 
   // ── 横条本体 ──────────────────────────────────────────────────────
   // AbovePrompt 只在 terminal 和 desktop 两个 surface 上拉起，所以这一个钩子
@@ -881,6 +980,33 @@ export const register: Register = (on, options) => {
           ) : null}
           <Button key="close" label="关闭" onPress={() => void $.ui.close({ id: GACHA_PANE })} />
         </Box>
+      </Box>
+    )
+  })
+
+  // ── 设置 Key 的面板 ────────────────────────────────────────────────
+
+  on('ui.render', { component: 'Pane' }, async ($, e, next) => {
+    if (e.requestId !== KEY_PANE) return next(e)
+
+    const elements = $.ui.resolve(e)
+    if (!('Input' in elements)) return next(e)
+    const { Box, Text, Button, Input } = elements
+    const message = await read($, keyMsgAtom)
+
+    return (
+      <Box flexDirection="column">
+        <Text bold>DeepSeek API Key</Text>
+        {/* 故意不给 value：提交后输入框自己清空，Key 不会停在画面上 */}
+        <Input
+          key="key"
+          placeholder="sk-… 回车保存"
+          onSubmit={(text) => void saveKey($, cfg, text)}
+        />
+        {message ? <Text>{message}</Text> : null}
+        <Text dimColor>存进 macOS 钥匙串：永久有效、不是明文、不进会话记录</Text>
+        <Text dimColor>仅 macOS；写入那一瞬 key 会出现在进程参数里（同用户可见）</Text>
+        <Button key="close" label="关闭" onPress={() => void $.ui.close({ id: KEY_PANE })} />
       </Box>
     )
   })

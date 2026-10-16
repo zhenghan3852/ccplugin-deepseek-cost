@@ -532,3 +532,109 @@ test('模型在第一次回答后才认出来，并记进 store 供后续会话�
   await band.redraw()
   expect(await band.find({ text: '¥40.36' })).toBeDefined()
 })
+
+// ── 设置 Key（写进 macOS 钥匙串）──────────────────────────────────────
+
+/** 面板的 props（设置 Key 那个）。 */
+const KEY_PANE_PROPS = {
+  title: '设置 API Key',
+  isFocused: true,
+  bodyColumns: 46,
+  placement: 'inline' as const,
+  scroll: { offset: 0, bodyRows: 10 },
+  view: {},
+}
+
+test('设置 Key：面板里回车 → 写进钥匙串并回报成功', async ($, on) => {
+  mock.env(on, {})
+  stubEngine(on)
+  stubBalance(on)
+  const runs: string[][] = []
+  on('process.run', ($, e) => {
+    runs.push([...e.argv])
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.invalidate', () => ({ value: undefined }))
+  await startSession($, on)
+  await runCommand($, 'deepseek-key')
+
+  const pane = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'deepseek-key',
+    viewport: { columns: 100, rows: 24 },
+    props: KEY_PANE_PROPS,
+  })
+  expect(await pane.find({ text: /DeepSeek API Key/ })).toBeDefined()
+
+  await pane.input({ key: 'key', text: 'sk-from-pane' })
+  const write = runs.find((argv) => argv.includes('add-generic-password'))
+  expect(write).toEqual([
+    'security',
+    'add-generic-password',
+    '-U',
+    '-s',
+    'deepseek-cost-hud',
+    '-a',
+    'apiKey',
+    '-w',
+    'sk-from-pane',
+  ])
+  expect(await pane.find({ text: /已存入钥匙串/ })).toBeDefined()
+})
+
+test('设置 Key：写失败就说失败，不假装成功', async ($, on) => {
+  mock.env(on, {})
+  stubEngine(on)
+  stubBalance(on)
+  on('process.run', () => ({
+    value: {
+      exitCode: 1,
+      stdout: '',
+      stderr: 'errSecAuthFailed',
+      isStdoutTruncated: false,
+      isStderrTruncated: false,
+    },
+  }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.invalidate', () => ({ value: undefined }))
+  await startSession($, on)
+  await runCommand($, 'deepseek-key')
+
+  const pane = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'deepseek-key',
+    viewport: { columns: 100, rows: 24 },
+    props: KEY_PANE_PROPS,
+  })
+  await pane.input({ key: 'key', text: 'sk-nope' })
+  expect(await pane.find({ text: /没存进去：errSecAuthFailed/ })).toBeDefined()
+  expect(await pane.find({ text: /已存入钥匙串/ })).toBeUndefined()
+})
+
+test('钥匙串里的 key 优先于环境变量 —— 真的用在余额请求上', async ($, on) => {
+  // 环境里有真 key 和代理令牌，但钥匙串里那份应该赢
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-from-env', ANTHROPIC_AUTH_TOKEN: 'ccs-proxy' })
+  stubEngine(on)
+  let sentAuth = ''
+  on('http.fetch', { url: /\/user\/balance$/ }, ($, e) => {
+    sentAuth = String(e.init?.headers?.Authorization ?? '')
+    return { value: { status: 200, ok: true, headers: {}, text: BALANCE_BODY } }
+  })
+  on('process.run', () => ({
+    value: {
+      exitCode: 0,
+      stdout: 'sk-from-keychain\n',
+      stderr: '',
+      isStdoutTruncated: false,
+      isStderrTruncated: false,
+    },
+  }))
+  await startSession($, on)
+
+  expect(sentAuth).toBe('Bearer sk-from-keychain')
+})
