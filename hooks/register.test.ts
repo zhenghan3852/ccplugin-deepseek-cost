@@ -6,9 +6,14 @@
  * 重点是第一条：横条挂在 `AbovePrompt` 上，而引擎只在 terminal 和 desktop
  * 两个 surface 渲染这个站点 —— 所以把同一份断言在两个 surface 上各跑一遍，
  * 就是「这一份代码真的跨端」的证据。
+ *
+ * 测试里的坑（踩过才知道）：session.start 不会自己跑，得测试先把它和它在
+ * 内部调用的接口都 stub 住再触发；否则钩子在第一个没实现的调用处被跳过，
+ * 后面整段都不执行，而测试只会含糊地报 no implementation。
  */
 
 import type { On } from 'claude-code'
+import type { Engine } from 'claude-code/testing'
 import { expect, mock, test } from 'claude-code/testing'
 
 const PLUGIN = 'deepseek-cost-hud'
@@ -45,16 +50,39 @@ function stubBalance(on: On): void {
   }))
 }
 
+/** 会话用量：横条上的上下文进度条取自这里。 */
+const SESSION_USAGE = {
+  startedAt: 0,
+  context: { tokens: 120_000, window: 1_000_000, percent: 12 },
+  rateLimits: [],
+}
+
+/**
+ * 引擎自带的接口测试里没人作答，插件用到哪几个就得替哪几个备一个。
+ * 横条隐藏时钩子走 next(e)，引擎接着画自己的内容 —— 那条路也要有个替身。
+ */
+function stubEngine(on: On): void {
+  on('command.register', () => ({ value: { command: '' } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.usage', () => ({ value: SESSION_USAGE }))
+  on('ui.render', () => ({ type: 'Text', props: {}, children: ['engine drew its own'] }))
+}
+
+/** 备齐一次会话开始所需的答案，再真的触发 session.start。 */
+async function startSession($: Engine, on: On): Promise<void> {
+  mock.clock(on)
+  mock.store(on)
+  on('session.start', () => ({ cwd: '/tmp/hud' }))
+  await $.session.start({ cwd: '/tmp/hud', surface: 'terminal', isInteractive: true })
+}
+
 /** 一条走完的轮次，带真实形状的 usage。 */
 const TURN = {
   answer: 'ok',
-  text: 'ok',
+  reason: 'answer',
   durationMs: 1200,
   isAborted: false,
   turnId: 'turn-1',
-  reason: 'answer',
-  category: null,
-  explanation: null,
   usage: {
     model: 'deepseek-flash',
     input_tokens: 3200,
@@ -66,9 +94,9 @@ const TURN = {
 
 test('横条在 terminal 和 desktop 两个 surface 上都画得出来', async ($, on) => {
   mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
   stubBalance(on)
-
-  await $.session.start({ cwd: '/tmp/hud', surface: 'terminal', isInteractive: true })
+  await startSession($, on)
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({
@@ -85,9 +113,12 @@ test('横条在 terminal 和 desktop 两个 surface 上都画得出来', async (
 
 test('走完一轮之后画出 token 用量', async ($, on) => {
   mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
   stubBalance(on)
+  // 所有替身都要在第一次调用 $ 之前登记
+  on('turn.complete', () => ({ text: '' }))
+  await startSession($, on)
 
-  await $.session.start({ cwd: '/tmp/hud', surface: 'terminal', isInteractive: true })
   await $.turn.complete(TURN)
 
   const ui = await $.ui.mount({
@@ -97,15 +128,15 @@ test('走完一轮之后画出 token 用量', async ($, on) => {
     props: BAND_PROPS,
   })
 
-  // ↑ 是未命中缓存的输入，↓ 是输出；两个数都来自上面那份 usage
-  expect(await ui.find({ text: /↑3\.2k ↓4\.5k/ })).toBeDefined()
+  // ↑ 是输入，↓ 是输出；两个数都来自上面那份 usage
+  expect(await ui.find({ text: '↑3.2k ↓4.5k' })).toBeDefined()
 })
 
 test('按下隐藏按钮后横条不再绘制', async ($, on) => {
   mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
   stubBalance(on)
-
-  await $.session.start({ cwd: '/tmp/hud', surface: 'terminal', isInteractive: true })
+  await startSession($, on)
 
   const ui = await $.ui.mount({
     plugin: PLUGIN,
@@ -124,9 +155,9 @@ test('按下隐藏按钮后横条不再绘制', async ($, on) => {
 
 test('没有 Key 时不画余额，只给一个可读的提示', async ($, on) => {
   mock.env(on, {})
+  stubEngine(on)
   stubBalance(on)
-
-  await $.session.start({ cwd: '/tmp/hud', surface: 'terminal', isInteractive: true })
+  await startSession($, on)
 
   const ui = await $.ui.mount({
     plugin: PLUGIN,

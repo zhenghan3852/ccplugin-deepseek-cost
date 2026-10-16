@@ -253,174 +253,179 @@ function cacheHitRate(usage: Usage): number | null {
 
 // ── 插件主体 ────────────────────────────────────────────────────────
 
-export const register: Register = (on, options) => {
-  const cfg = readSettings(options)
+// 引擎会先静态扫描模块用了哪些接口方法，才决定加载它。扫描要求 `$` 只递给
+// 本文件**顶层**声明的函数 —— 递给嵌套函数就扫不到，整个模块被拒，而且是
+// 静默的：会话照常开始，不报错，只是这个 mod 一个钩子都没注册。所以下面四个
+// 用到 `$` 的函数必须留在顶层，不能挪进 register 里。
+//
+// 定时器句柄与并发闸门。模块级变量在热重载后会丢失，所以只放真正属于
+// 这次运行时载入的东西；显示用的值一律走 $.state。
+let timer: { cancel: () => void } | null = null
+let isFetching = false
 
-  // 模块级变量在热重载后会丢失，所以只用来存真正属于这次运行时载入的东西
-  //（定时器句柄、并发闸门）；显示用的值一律走 $.state。
-  let timer: { cancel: () => void } | null = null
-  let isFetching = false
+/**
+ * 按优先级找 API Key：
+ * 插件配置 → 插件自带存储（/deepseek-key 存的） → DEEPSEEK_API_KEY → ANTHROPIC_AUTH_TOKEN
+ */
+async function resolveKey($: EngineInterface, cfg: Settings): Promise<string> {
+  if (cfg.apiKey) return cfg.apiKey
 
-  /**
-   * 按优先级找 API Key：
-   * 插件配置 → 插件自带存储（/deepseek-key 存的） → DEEPSEEK_API_KEY → ANTHROPIC_AUTH_TOKEN
-   */
-  async function resolveKey($: EngineInterface): Promise<string> {
-    if (cfg.apiKey) return cfg.apiKey
+  const stored = await $.store.get('apiKey')
+  if (typeof stored === 'string' && stored.trim()) return stored.trim()
 
-    const stored = await $.store.get('apiKey')
-    if (typeof stored === 'string' && stored.trim()) return stored.trim()
+  const direct = await $.env.get('DEEPSEEK_API_KEY')
+  if (direct?.trim()) return direct.trim()
 
-    const direct = await $.env.get('DEEPSEEK_API_KEY')
-    if (direct?.trim()) return direct.trim()
+  // 用 cc-switch 之类把 Claude Code 路由到 DeepSeek 时，key 落在 ANTHROPIC_AUTH_TOKEN
+  const routed = await $.env.get('ANTHROPIC_AUTH_TOKEN')
+  if (routed?.trim()) return routed.trim()
 
-    // 用 cc-switch 之类把 Claude Code 路由到 DeepSeek 时，key 落在 ANTHROPIC_AUTH_TOKEN
-    const routed = await $.env.get('ANTHROPIC_AUTH_TOKEN')
-    if (routed?.trim()) return routed.trim()
+  return ''
+}
 
-    return ''
-  }
-
-  /** 拉一次余额并写进状态；失败只记原因，不抛。 */
-  async function refreshBalance($: EngineInterface): Promise<void> {
-    if (isFetching) return
-    isFetching = true
-    try {
-      const key = await resolveKey($)
-      if (!key) {
-        await update($, errorAtom, () => 'no-key')
-        return
-      }
-
-      const res = await $.http.fetch(`${cfg.apiBase}/user/balance`, {
-        headers: {
-          Accept: 'application/json',
-          Authorization: `Bearer ${key}`,
-        },
-      })
-
-      if (!res.ok) {
-        await update($, errorAtom, () => `HTTP ${res.status}`)
-        return
-      }
-
-      const payload = JSON.parse(res.text) as BalancePayload
-      const info = payload.balance_infos?.[0]
-      const next: Balance = {
-        isAvailable: payload.is_available === true,
-        currency: info?.currency ?? 'CNY',
-        total: toNumber(info?.total_balance),
-        granted: toNumber(info?.granted_balance),
-        toppedUp: toNumber(info?.topped_up_balance),
-        fetchedAt: await $.clock.now(),
-      }
-
-      // 本会话第一次读到余额时把它记成基准，之后就能算实测消耗
-      const current = await read($, usageAtom)
-      if (current.startBalance === null) {
-        await update($, usageAtom, prev => ({
-          ...prev,
-          startBalance: next.total,
-          startCurrency: next.currency,
-        }))
-      }
-
-      await update($, balanceAtom, () => next)
-      await update($, errorAtom, () => null)
-      // 存一份，下次会话首屏就能立刻显示真实余额，不用等网络
-      await $.store.set('balance', next)
-    } catch (err) {
-      await update($, errorAtom, () => messageOf(err))
-    } finally {
-      isFetching = false
-    }
-  }
-
-  /** 顶一条单行摘要到状态行 —— 终端里横条被折叠时靠它兜底。 */
-  async function paintStatus($: EngineInterface): Promise<void> {
-    if (await read($, hiddenAtom)) {
-      $.ui.status(undefined)
+/** 拉一次余额并写进状态；失败只记原因，不抛。 */
+async function refreshBalance($: EngineInterface, cfg: Settings): Promise<void> {
+  if (isFetching) return
+  isFetching = true
+  try {
+    const key = await resolveKey($, cfg)
+    if (!key) {
+      await update($, errorAtom, () => 'no-key')
       return
     }
 
-    const parts: string[] = []
-    const balance = await read($, balanceAtom)
+    const res = await $.http.fetch(`${cfg.apiBase}/user/balance`, {
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${key}`,
+      },
+    })
 
-    if (cfg.showBalance) {
-      const error = await read($, errorAtom)
-      if (balance) {
-        parts.push(`DeepSeek ${money(balance.total, currencySymbol(balance.currency))}`)
-      } else if (error) {
-        parts.push(`DeepSeek ${shortError(error)}`)
-      }
+    if (!res.ok) {
+      await update($, errorAtom, () => `HTTP ${res.status}`)
+      return
     }
 
-    if (cfg.showUsage) {
-      const usage = await read($, usageAtom)
-      if (usage.turns > 0) {
-        parts.push(`↑${compact(usage.inputTokens)} ↓${compact(usage.outputTokens)}`)
-        const spent = measuredSpend(usage, balance)
-        if (spent) {
-          parts.push(`实测${money(spent.amount, currencySymbol(spent.currency))}`)
-        } else {
-          parts.push(`≈${money(usage.estimatedCost, cfg.priceSymbol)}`)
-        }
-      }
+    const payload = JSON.parse(res.text) as BalancePayload
+    const info = payload.balance_infos?.[0]
+    const next: Balance = {
+      isAvailable: payload.is_available === true,
+      currency: info?.currency ?? 'CNY',
+      total: toNumber(info?.total_balance),
+      granted: toNumber(info?.granted_balance),
+      toppedUp: toNumber(info?.topped_up_balance),
+      fetchedAt: await $.clock.now(),
     }
 
-    $.ui.status(parts.length > 0 ? parts.join('  ·  ') : undefined)
+    // 本会话第一次读到余额时把它记成基准，之后就能算实测消耗
+    const current = await read($, usageAtom)
+    if (current.startBalance === null) {
+      await update($, usageAtom, prev => ({
+        ...prev,
+        startBalance: next.total,
+        startCurrency: next.currency,
+      }))
+    }
+
+    await update($, balanceAtom, () => next)
+    await update($, errorAtom, () => null)
+    // 存一份，下次会话首屏就能立刻显示真实余额，不用等网络
+    await $.store.set('balance', next)
+  } catch (err) {
+    await update($, errorAtom, () => messageOf(err))
+  } finally {
+    isFetching = false
+  }
+}
+
+/** 顶一条单行摘要到状态行 —— 终端里横条被折叠时靠它兜底。 */
+async function paintStatus($: EngineInterface, cfg: Settings): Promise<void> {
+  if (await read($, hiddenAtom)) {
+    $.ui.status(undefined)
+    return
   }
 
-  /** `/deepseek-cost` 的完整报告 —— 实测和估算摆在一起看偏差。 */
-  async function costReport($: EngineInterface): Promise<string> {
-    const balance = await read($, balanceAtom)
-    const usage = await read($, usageAtom)
-    const rows: string[] = []
+  const parts: string[] = []
+  const balance = await read($, balanceAtom)
 
+  if (cfg.showBalance) {
+    const error = await read($, errorAtom)
     if (balance) {
-      rows.push(`余额        ${money(balance.total, currencySymbol(balance.currency))}（充值 ${balance.toppedUp.toFixed(2)} + 赠送 ${balance.granted.toFixed(2)}）`)
-    } else {
-      rows.push('余额        尚未取到（用 /deepseek-key 配 Key，或设 DEEPSEEK_API_KEY）')
+      parts.push(`DeepSeek ${money(balance.total, currencySymbol(balance.currency))}`)
+    } else if (error) {
+      parts.push(`DeepSeek ${shortError(error)}`)
     }
+  }
 
-    if (usage.turns === 0) {
-      rows.push('本会话      还没有走完一轮，暂无用量')
-      return rows.join('\n')
-    }
-
-    const measured = measuredSpend(usage, balance)
-    if (usage.startBalance !== null) {
-      rows.push(`会话起始    ${usage.startBalance.toFixed(2)} ${usage.startCurrency}`)
-    }
-
-    if (measured) {
-      const measuredText = moneyFine(measured.amount, currencySymbol(measured.currency))
-      rows.push(`实测消耗    ${measuredText}   （余额差额，含官方一切折扣）`)
-      if (cfg.showEstimate && usage.estimatedCost > 0) {
-        // 币种不同就不能直接比，只并列摆出来
-        if (measured.currency === cfg.priceCurrency) {
-          const delta = (usage.estimatedCost - measured.amount) / measured.amount
-          const sign = delta >= 0 ? '+' : ''
-          rows.push(`估算消耗    ${moneyFine(usage.estimatedCost, cfg.priceSymbol)}   （偏差 ${sign}${(delta * 100).toFixed(1)}%）`)
-        } else {
-          rows.push(`估算消耗    ${moneyFine(usage.estimatedCost, cfg.priceSymbol)}   （币种与余额不同，不做偏差对比）`)
-        }
+  if (cfg.showUsage) {
+    const usage = await read($, usageAtom)
+    if (usage.turns > 0) {
+      parts.push(`↑${compact(usage.inputTokens)} ↓${compact(usage.outputTokens)}`)
+      const spent = measuredSpend(usage, balance)
+      if (spent) {
+        parts.push(`实测${money(spent.amount, currencySymbol(spent.currency))}`)
+      } else {
+        parts.push(`≈${money(usage.estimatedCost, cfg.priceSymbol)}`)
       }
-    } else if (cfg.showEstimate) {
-      rows.push(`估算消耗    ${moneyFine(usage.estimatedCost, cfg.priceSymbol)}   （拿不到余额差额，只有估算）`)
     }
+  }
 
-    const hitRate = cacheHitRate(usage)
-    rows.push(
-      `token       ↑${compact(usage.inputTokens)}（缓存命中 ${compact(usage.cacheReadTokens)} / 未命中 ${compact(usage.inputTokens + usage.cacheWriteTokens)}）  ↓${compact(usage.outputTokens)}   共 ${usage.turns} 轮`,
-    )
-    if (hitRate !== null) {
-      rows.push(`缓存命中率  ${(hitRate * 100).toFixed(1)}%`)
-    }
-    rows.push(`当前计价    ${isPeak(Date.now()) ? '高峰' : `错峰（高峰价的 ${(cfg.offPeakRatio * 100).toFixed(0)}%）`}`)
+  $.ui.status(parts.length > 0 ? parts.join('  ·  ') : undefined)
+}
 
+/** `/deepseek-cost` 的完整报告 —— 实测和估算摆在一起看偏差。 */
+async function costReport($: EngineInterface, cfg: Settings): Promise<string> {
+  const balance = await read($, balanceAtom)
+  const usage = await read($, usageAtom)
+  const rows: string[] = []
+
+  if (balance) {
+    rows.push(`余额        ${money(balance.total, currencySymbol(balance.currency))}（充值 ${balance.toppedUp.toFixed(2)} + 赠送 ${balance.granted.toFixed(2)}）`)
+  } else {
+    rows.push('余额        尚未取到（用 /deepseek-key 配 Key，或设 DEEPSEEK_API_KEY）')
+  }
+
+  if (usage.turns === 0) {
+    rows.push('本会话      还没有走完一轮，暂无用量')
     return rows.join('\n')
   }
+
+  const measured = measuredSpend(usage, balance)
+  if (usage.startBalance !== null) {
+    rows.push(`会话起始    ${usage.startBalance.toFixed(2)} ${usage.startCurrency}`)
+  }
+
+  if (measured) {
+    const measuredText = moneyFine(measured.amount, currencySymbol(measured.currency))
+    rows.push(`实测消耗    ${measuredText}   （余额差额，含官方一切折扣）`)
+    if (cfg.showEstimate && usage.estimatedCost > 0) {
+      // 币种不同就不能直接比，只并列摆出来
+      if (measured.currency === cfg.priceCurrency) {
+        const delta = (usage.estimatedCost - measured.amount) / measured.amount
+        const sign = delta >= 0 ? '+' : ''
+        rows.push(`估算消耗    ${moneyFine(usage.estimatedCost, cfg.priceSymbol)}   （偏差 ${sign}${(delta * 100).toFixed(1)}%）`)
+      } else {
+        rows.push(`估算消耗    ${moneyFine(usage.estimatedCost, cfg.priceSymbol)}   （币种与余额不同，不做偏差对比）`)
+      }
+    }
+  } else if (cfg.showEstimate) {
+    rows.push(`估算消耗    ${moneyFine(usage.estimatedCost, cfg.priceSymbol)}   （拿不到余额差额，只有估算）`)
+  }
+
+  const hitRate = cacheHitRate(usage)
+  rows.push(
+    `token       ↑${compact(usage.inputTokens)}（缓存命中 ${compact(usage.cacheReadTokens)} / 未命中 ${compact(usage.inputTokens + usage.cacheWriteTokens)}）  ↓${compact(usage.outputTokens)}   共 ${usage.turns} 轮`,
+  )
+  if (hitRate !== null) {
+    rows.push(`缓存命中率  ${(hitRate * 100).toFixed(1)}%`)
+  }
+  rows.push(`当前计价    ${isPeak(Date.now()) ? '高峰' : `错峰（高峰价的 ${(cfg.offPeakRatio * 100).toFixed(0)}%）`}`)
+
+  return rows.join('\n')
+}
+
+export const register: Register = (on, options) => {
+  const cfg = readSettings(options)
 
   // ── 会话开始：铺首屏、注册命令、拉余额、起定时器 ──────────────────
 
@@ -457,15 +462,15 @@ export const register: Register = (on, options) => {
     })
 
     // 3) 拉一次真实余额（有缓存也拉，让数字尽快变准），顺带立下实测基准
-    await refreshBalance($)
-    await paintStatus($)
+    await refreshBalance($, cfg)
+    await paintStatus($, cfg)
 
     // 4) 起定时刷新。定时器归引擎的时钟管，钩子这一趟结束也照样跑，
     //    直到 cancel() 或模块被重载（重载会把上一个环境的定时器一并丢掉，
     //    所以这里 cancel 只是防御性的）。
     timer?.cancel()
     timer = $.clock.every(cfg.refreshMs, () => {
-      void refreshBalance($).then(() => paintStatus($))
+      void refreshBalance($, cfg).then(() => paintStatus($, cfg))
     })
 
     return next(e)
@@ -519,7 +524,7 @@ export const register: Register = (on, options) => {
       }))
     }
 
-    await paintStatus($)
+    await paintStatus($, cfg)
     return next(e)
   })
 
@@ -528,15 +533,15 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'deepseek-hud' }, async ($, e) => {
     const hidden = await read($, hiddenAtom)
     await update($, hiddenAtom, () => !hidden)
-    await paintStatus($)
+    await paintStatus($, cfg)
     return { text: hidden ? 'DeepSeek HUD 已显示。' : 'DeepSeek HUD 已隐藏。' }
   })
 
-  on('command.run', { command: 'deepseek-cost' }, async $ => ({ text: await costReport($) }))
+  on('command.run', { command: 'deepseek-cost' }, async $ => ({ text: await costReport($, cfg) }))
 
   on('command.run', { command: 'deepseek-refresh' }, async ($, e) => {
-    await refreshBalance($)
-    await paintStatus($)
+    await refreshBalance($, cfg)
+    await paintStatus($, cfg)
     const error = await read($, errorAtom)
     const balance = await read($, balanceAtom)
     if (error) return { text: `刷新失败：${shortError(error)}` }
@@ -552,8 +557,8 @@ export const register: Register = (on, options) => {
       }
     }
     await $.store.set('apiKey', key)
-    await refreshBalance($)
-    await paintStatus($)
+    await refreshBalance($, cfg)
+    await paintStatus($, cfg)
     const error = await read($, errorAtom)
     return { text: error ? `Key 已保存，但刷新失败：${shortError(error)}` : 'Key 已保存，余额已刷新。' }
   })
