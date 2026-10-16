@@ -424,6 +424,9 @@ test('转盘逐帧推进，走完停在开奖态', async ($, on) => {
     props: PANE_PROPS,
   })
   expect(await pane.find({ text: '转动中…' })).toBeDefined()
+  // 宽度必须撑住：11×11 全是实心块，拼起来是连续 121 个 —— 一旦被折叠/压窄
+  // 就不是这个数（"转盘变扁"那个 bug 的回归护栏，屏幕我看不到，让测试盯着）
+  expect(await pane.find({ text: new RegExp(`█{${WHEEL_SIZE * WHEEL_SIZE}}`) })).toBeDefined()
 
   // 帧数走完（时钟是 mock 的，推进多少就是多少）
   await clock.advance(WHEEL_TICK_MS * WHEEL_FRAMES)
@@ -498,7 +501,9 @@ test('配置面板：只列本插件的行，改动写回配置', async ($, on) 
         isLocked: false,
       },
       {
-        key: 'deepseek-cost-hud.showCycle',
+        // key 用**完整 pluginId**：引擎报的就是这个形式（踩过坑 —— 按裸名字
+        // 过滤的话一个都匹配不上，面板会只剩表头）
+        key: 'deepseek-cost-hud@ccplugin-deepseek-cost.showCycle',
         label: '显示花费进度条',
         kind: 'boolean',
         value: true,
@@ -506,7 +511,7 @@ test('配置面板：只列本插件的行，改动写回配置', async ($, on) 
         isLocked: false,
       },
       {
-        key: 'deepseek-cost-hud.priceCurrency',
+        key: 'deepseek-cost-hud@ccplugin-deepseek-cost.priceCurrency',
         label: '估算值的货币',
         kind: 'choice',
         value: 'CNY',
@@ -541,9 +546,11 @@ test('配置面板：只列本插件的行，改动写回配置', async ($, on) 
   // Key 不在面板里，但要有指路的话
   expect(await pane.find({ text: /API Key 不在上面/ })).toBeDefined()
 
-  // 按下开关：写回的是反向值
+  // 按下开关：写回的是反向值，key 原样带完整 pluginId
   await pane.press({ key: 'v-showCycle' })
-  expect(sets).toEqual([{ key: 'deepseek-cost-hud.showCycle', value: false }])
+  expect(sets).toEqual([
+    { key: 'deepseek-cost-hud@ccplugin-deepseek-cost.showCycle', value: false },
+  ])
 })
 
 test('配置面板：被拒绝时给出提示，不假装改成功', async ($, on) => {
@@ -583,6 +590,40 @@ test('配置面板：被拒绝时给出提示，不假装改成功', async ($, o
   })
   await pane.press({ key: 'v-showCycle' })
   expect(toasts).toEqual(['没改成：锁定策略不让改'])
+})
+
+test('配置面板：一行都没匹配上时，把引擎实际报的 key 印出来', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  stubEngine(on)
+  stubBalance(on)
+  // 只有引擎自己的行 —— 上面那个坑再来一次的话，这条会立刻指出 key 长什么样
+  on('config.list', () => ({
+    value: [
+      {
+        key: 'theme',
+        label: 'Theme',
+        kind: 'choice',
+        value: 'dark',
+        options: ['dark', 'light'],
+        provider: { plugin: 'engine', tier: 'core' },
+        isLocked: false,
+      },
+    ],
+  }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  await startSession($, on)
+  await runCommand($, 'deepseek-config')
+
+  const pane = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'deepseek-config',
+    viewport: { columns: 100, rows: 40 },
+    props: PANE_PROPS,
+  })
+  expect(await pane.find({ text: /没读到本插件的配置行/ })).toBeDefined()
+  expect(await pane.find({ text: /theme/ })).toBeDefined()
 })
 
 test('每走完一轮就多一次抽奖机会，次数记在全局账本上', async ($, on) => {

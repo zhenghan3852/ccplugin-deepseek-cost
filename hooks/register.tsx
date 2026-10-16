@@ -40,7 +40,6 @@ import type {
   Register,
   RenderElement,
   RenderNode,
-  RenderSurface,
 } from 'claude-code'
 
 import type { Balance, GachaRecord, HudError, Spin, TierId, Usage } from '../types'
@@ -471,15 +470,17 @@ const CONFIG_PANE = 'deepseek-config'
 const DEX_PANE = 'deepseek-dex'
 
 /**
- * 一个色块的填充字符。
+ * 一个色块的字形：**实心块 `█`**，不用空格。
  *
- * 终端用普通空格 —— 底色从空格里透出来，正好占满一格。
- * **桌面端要用不换行空格**：那边的渲染器会把连续普通空格折叠掉，于是 11 格宽
- * 的圆环被压成两三格（真出现过：侧面弹出来的转盘是扁的）。不换行空格不折叠。
+ * 走过两次弯路，记在这里免得重犯：
+ *   1. 用普通空格填 —— 终端的空格一格一格占位、底色透出来，但桌面端的渲染器
+ *      会把连续空格折叠掉，11 格宽被压成两三格；
+ *   2. 改用不换行空格 —— 仍然被压扁，说明那边的问题不只是空白折叠。
+ * 实心块是真正的字形，宽度不依赖空白规则，两个端上都稳。
  */
-function cellFill(surface: RenderSurface, width: number): string {
-  return (surface === 'terminal' ? ' ' : ' ').repeat(width)
-}
+const CELL = '█'
+/** 指针画在一个 11 格的轨道上，中间那格是 ▼。 */
+const POINTER_MARK = '▼'
 
 let spinTimer: { cancel: () => void } | null = null
 
@@ -492,11 +493,28 @@ let spinTimer: { cancel: () => void } | null = null
 //   · API Key 不在其中 —— 它标了 sensitive，引擎不给敏感字段建 `/config` 行
 //   · 改动要 /reload-plugins 才生效 —— 配置是 register() 时一次性读走的
 
-/** 本插件 userConfig 行的 key 前缀。 */
-const CONFIG_PREFIX = 'deepseek-cost-hud.'
+/** 本插件的名字（清单里的 `name`）。 */
+const PLUGIN_NAME = 'deepseek-cost-hud'
 
+/**
+ * 本插件的 userConfig 行。
+ *
+ * key 的形式是 `<pluginId>.<字段>`，而 pluginId 是**带 marketplace 的完整 id**
+ * （`deepseek-cost-hud@ccplugin-deepseek-cost`）—— 这里是踩过的坑：第一版按
+ * `deepseek-cost-hud.` 前缀过滤，一个都没匹配上，面板只剩表头没有控件。
+ * 现在两种写法都认。
+ */
 function ownConfigRows(rows: readonly ConfigRow[]): ConfigRow[] {
-  return rows.filter((row) => row.key.startsWith(CONFIG_PREFIX))
+  return rows.filter((row) => {
+    const owner = row.key.split('.')[0] ?? ''
+    return owner === PLUGIN_NAME || owner.startsWith(`${PLUGIN_NAME}@`)
+  })
+}
+
+/** 行 key 去掉 `<pluginId>.` 之后的字段名。 */
+function configField(key: string): string {
+  const owner = key.split('.')[0] ?? ''
+  return key.slice(owner.length + 1)
 }
 
 /** 配置值上屏的写法。 */
@@ -882,30 +900,40 @@ export const register: Register = (on, options) => {
     if (spin.phase === 'idle' || !spin.tier) return next(e)
 
     const { Box, Text, Button } = $.ui.resolve(e)
-    const surface = e.surface
     const tier = TIER_BY_ID[spin.tier]
     const item = spin.itemId ? ITEM_BY_ID[spin.itemId] : undefined
     const revealed = spin.phase === 'revealed'
 
-    // 指针画在轮盘正上方：不画的话看不出"停在哪一块"是看顶部那格
+    // 指针轨道：11 格里中间那格是 ▼。用实心块做对齐，不用空白 —— 空白会被折叠。
+    const halfway = (WHEEL_SIZE - 1) / 2
     const pointer = (
-      <Text key="pointer" color="claude">
-        {cellFill(surface, (WHEEL_SIZE - 1) / 2)}▼
-      </Text>
+      <Box key="pointer" flexDirection="row" flexShrink={0}>
+        <Text dimColor>{CELL.repeat(halfway)}</Text>
+        <Text color="claude" bold>
+          {POINTER_MARK}
+        </Text>
+        <Text dimColor>{CELL.repeat(halfway)}</Text>
+      </Box>
     )
+    // flexShrink={0}：面板窄的时候不许把每一行压窄，那正是"转盘变扁"的第二个原因
     const wheel = wheelGrid(spin.slots, spin.winner, revealed ? WHEEL_FRAMES - 1 : spin.frame).map(
       (cells, y) => (
-        <Box key={`row${y}`} flexDirection="row">
-          {encodeRow(cells).map((run, x) => {
-            const color = run.tier === null ? null : TIER_BY_ID[run.tier].color
-            return color === null ? (
-              <Text key={`cell${x}`}>{cellFill(surface, run.width)}</Text>
-            ) : (
-              <Text key={`cell${x}`} backgroundColor={color}>
-                {cellFill(surface, run.width)}
+        <Box key={`row${y}`} flexDirection="row" flexShrink={0}>
+          {encodeRow(cells).map((run, x) =>
+            run.tier === null ? (
+              <Text key={`cell${x}`} dimColor>
+                {CELL.repeat(run.width)}
               </Text>
-            )
-          })}
+            ) : (
+              <Text
+                key={`cell${x}`}
+                color={TIER_BY_ID[run.tier].color}
+                backgroundColor={TIER_BY_ID[run.tier].color}
+              >
+                {CELL.repeat(run.width)}
+              </Text>
+            ),
+          )}
         </Box>
       ),
     )
@@ -944,7 +972,8 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane' }, async ($, e, next) => {
     if (e.requestId !== CONFIG_PANE) return next(e)
 
-    const rows = ownConfigRows(await $.config.list())
+    const all = await $.config.list()
+    const rows = ownConfigRows(all)
     const elements = $.ui.resolve(e)
     // 元素表按 surface 给，是个联合类型：有的 surface 没有 Input / Select。
     // 真遇到就交回引擎自己画，别硬撑一个改不了的配置面板。
@@ -952,7 +981,7 @@ export const register: Register = (on, options) => {
     const { Box, Text, Button, Input, Select } = elements
 
     const controls = rows.map((row) => {
-      const name = row.key.slice(CONFIG_PREFIX.length)
+      const name = configField(row.key)
       let control: RenderElement
       if (row.kind === 'boolean') {
         control = (
@@ -992,6 +1021,14 @@ export const register: Register = (on, options) => {
       <Box flexDirection="column">
         <Text bold>插件配置</Text>
         {controls}
+        {rows.length === 0 ? (
+          // 空的时候把引擎实际报的行 key 印出来 —— 免得又一次"面板一片空白、
+          // 看不出是过滤条件错了还是真没有"，那是我上一版栽的坑。
+          <Text dimColor>
+            （没读到本插件的配置行。引擎报回来的是：
+            {all.map((row) => row.key).join('  ') || '空列表'}）
+          </Text>
+        ) : null}
         <Text dimColor>改完运行 /reload-plugins 生效 —— 配置是插件加载时读的</Text>
         <Text dimColor>API Key 不在上面：它标了 sensitive，只经 /plugin 的 Configure options</Text>
         <Text dimColor>或 shell 的 claude plugin configure 设置，不会落到明文文件里</Text>
