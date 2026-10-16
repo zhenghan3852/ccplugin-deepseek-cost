@@ -69,9 +69,49 @@ function stubBalance(on: On): void {
  * `claude-haiku-4-5[1m]` 这种），判断不了"是不是 DeepSeek"。上游真名只从每轮
  * `turn.complete` 的响应里认，认到后会记进 store 供后续会话回放。
  */
-function stubEngine(on: On): void {
+/**
+ * 假账本：账本现在是 `$.fs` 里的一个文件 —— **不走 `$.store`**，因为后者的读会被
+ * 进程缓存，长命会话每次写都会把别的会话的新值覆盖回去。所以测试要假 fs。
+ * 不给 seed 就是"文件不存在"。
+ */
+function fakeLedger(seed: { spent: number; drawn?: number; owned?: Record<string, number> }) {
+  let content: string | null = JSON.stringify({
+    spent: seed.spent,
+    drawn: seed.drawn ?? 0,
+    owned: seed.owned ?? {},
+  })
+  return {
+    read(): { spent: number; drawn: number; owned: Record<string, number> } | null {
+      return content === null ? null : JSON.parse(content)
+    },
+    stub(on: On): void {
+      on('fs.read', () => {
+        if (content === null) return { deny: 'ENOENT' }
+        return { value: content }
+      })
+      on('fs.write', ($, e) => {
+        content = String(e.text ?? '')
+        return { value: undefined }
+      })
+    },
+  }
+}
+
+/** 空账本（文件不存在）。 */
+function noLedger(): ReturnType<typeof fakeLedger> {
+  const l = fakeLedger({ spent: 0, drawn: 0 })
+  // 让它表现为"文件不存在"，从而走空账本路径
+  ;(l as { stub: (on: On) => void }).stub = ((on: On) => {
+    on('fs.read', () => ({ deny: 'ENOENT' }))
+    on('fs.write', () => ({ value: undefined }))
+  }).bind(l) as never
+  return l
+}
+
+function stubEngine(on: On, ledger: ReturnType<typeof fakeLedger> = noLedger()): void {
   on('command.register', () => ({ value: { command: '' } }))
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['engine drew its own'] }))
+  ledger.stub(on)
 }
 
 /** 备齐一次会话开始所需的答案，再真的触发 session.start。 */
@@ -354,21 +394,21 @@ test('转盘是个圆环：中心和四角留空，环上有档位', () => {
 
 test('抽奖：命令只开面板不抽，点「开始抽奖」才真的抽', async ($, on) => {
   mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
-  stubEngine(on)
+  const ledger = fakeLedger({ spent: 3, drawn: 0 })
+  stubEngine(on, ledger)
   stubBalance(on)
   let openCalls = 0
   on('ui.open', () => {
     openCalls += 1
     return { value: { isPlaced: true } }
   })
-  const store = fakeStore({ gacha: { spent: 3, drawn: 0, owned: {} } })
-  await startSession($, on, () => store.stub(on))
+  await startSession($, on)
 
   const answer = await runCommand($, 'deepseek-draw')
   expect(answer.text).toContain('还剩 3 次')
   expect(openCalls).toBe(1)
   // 命令跑完时账本一点没动 —— 抽奖是人点的，不是命令替人按的
-  expect((store.saved.get('gacha') as { drawn: number }).drawn).toBe(0)
+  expect((ledger.read()!).drawn).toBe(0)
 
   const pane = await $.ui.mount({
     plugin: PLUGIN,
@@ -383,50 +423,50 @@ test('抽奖：命令只开面板不抽，点「开始抽奖」才真的抽', as
 
   // 点了才抽
   await pane.press({ key: 'start' })
-  const record = store.saved.get('gacha') as { drawn: number; owned: Record<string, number> }
+  const record = ledger.read()!
   expect(record.drawn).toBe(1)
   expect(Object.values(record.owned)).toEqual([1])
 })
 
 test('面板放不下时不偷抽，只回一句可操作的话', async ($, on) => {
   mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
-  stubEngine(on)
+  const ledger = fakeLedger({ spent: 1, drawn: 0 })
+  stubEngine(on, ledger)
   stubBalance(on)
   on('ui.open', () => ({ value: { isPlaced: false, reason: '终端太窄' } }))
-  const store = fakeStore({ gacha: { spent: 1, drawn: 0, owned: {} } })
-  await startSession($, on, () => store.stub(on))
+  await startSession($, on)
 
   const answer = await runCommand($, 'deepseek-draw')
   expect(answer.text).toContain('放不下面板')
   // 次数一次都不能扣：没人点过"开始抽奖"
-  expect((store.saved.get('gacha') as { drawn: number }).drawn).toBe(0)
+  expect((ledger.read()!).drawn).toBe(0)
 })
 
 test('没有可抽次数时不抽，也不开面板', async ($, on) => {
   mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
-  stubEngine(on)
+  const ledger = fakeLedger({ spent: 0, drawn: 0 })
+  stubEngine(on, ledger)
   stubBalance(on)
   let openCalls = 0
   on('ui.open', () => {
     openCalls += 1
     return { value: { isPlaced: true } }
   })
-  const store = fakeStore({ gacha: { spent: 0, drawn: 0, owned: {} } })
-  await startSession($, on, () => store.stub(on))
+  await startSession($, on)
 
   const answer = await runCommand($, 'deepseek-draw')
   expect(answer.text).toContain('还没有可抽的次数')
   expect(openCalls).toBe(0)
-  expect((store.saved.get('gacha') as { drawn: number }).drawn).toBe(0)
+  expect((ledger.read()!).drawn).toBe(0)
 })
 
 test('转盘逐帧推进，走完停在开奖态', async ($, on) => {
   mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
-  stubEngine(on)
+  const ledger = fakeLedger({ spent: 2, drawn: 0 })
+  stubEngine(on, ledger)
   stubBalance(on)
   on('ui.open', () => ({ value: { isPlaced: true } }))
-  const store = fakeStore({ gacha: { spent: 2, drawn: 0, owned: {} } })
-  const clock = await startSession($, on, () => store.stub(on))
+  const clock = await startSession($, on)
 
   await runCommand($, 'deepseek-draw')
 
@@ -457,14 +497,12 @@ test('转盘逐帧推进，走完停在开奖态', async ($, on) => {
 
 test('图鉴：命令回一行汇总，明细在面板里按档列出来', async ($, on) => {
   mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
-  stubEngine(on)
+  const ledger = fakeLedger({ spent: 5, drawn: 2, owned: { tissue: 1, 'milk-tea': 1 } })
+  stubEngine(on, ledger)
   stubBalance(on)
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.invalidate', () => ({ value: undefined }))
-  const store = fakeStore({
-    gacha: { spent: 5, drawn: 2, owned: { tissue: 1, 'milk-tea': 1 } },
-  })
-  await startSession($, on, () => store.stub(on))
+  await startSession($, on)
 
   const answer = await runCommand($, 'deepseek-dex')
   expect(answer.text).toContain('3 次') // floor(5) - 2
@@ -488,13 +526,11 @@ test('图鉴：命令回一行汇总，明细在面板里按档列出来', async
 
 test('图鉴：面板放不下时回退成完整文本，信息不丢', async ($, on) => {
   mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
-  stubEngine(on)
+  const ledger = fakeLedger({ spent: 5, drawn: 2, owned: { tissue: 1 } })
+  stubEngine(on, ledger)
   stubBalance(on)
   on('ui.open', () => ({ value: { isPlaced: false, reason: '终端太窄' } }))
-  const store = fakeStore({
-    gacha: { spent: 5, drawn: 2, owned: { tissue: 1 } },
-  })
-  await startSession($, on, () => store.stub(on))
+  await startSession($, on)
 
   const answer = await runCommand($, 'deepseek-dex')
   expect(answer.text).toContain('普通（≈¥1）  1/70')
@@ -504,11 +540,11 @@ test('图鉴：面板放不下时回退成完整文本，信息不丢', async ($
 
 test('每走完一轮就多一次抽奖机会，次数记在全局账本上', async ($, on) => {
   mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
-  stubEngine(on)
+  const ledger = fakeLedger({ spent: 0, drawn: 0 })
+  stubEngine(on, ledger)
   stubBalance(on)
   on('turn.complete', () => ({ text: '' }))
-  const store = fakeStore({ gacha: { spent: 0, drawn: 0, owned: {} } })
-  await startSession($, on, () => store.stub(on))
+  await startSession($, on)
 
   // 错峰下 26.25 万输出 token × ¥8/M × 50% = ¥1.05 —— 刚好攒满一次
   await $.turn.complete({
@@ -522,7 +558,7 @@ test('每走完一轮就多一次抽奖机会，次数记在全局账本上', as
     },
   })
 
-  const record = store.saved.get('gacha') as { spent: number }
+  const record = ledger.read()!
   expect(Math.round(record.spent * 100) / 100).toBe(1.05)
 })
 
@@ -718,4 +754,48 @@ test('resume/clear 之后横条还在：不靠 session.start 也能认出模型'
   })
   // 模型从 store 回放出来了，余额也铺上了 —— 横条必须还在
   expect(await band.find({ text: '¥40.36' })).toBeDefined()
+})
+
+test('进度条走"本机累计"（和发次数同口径），token 与估算仍是本会话', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  // 本机累计 3.4 元，本会话一分没花
+  const ledger = fakeLedger({ spent: 3.4 })
+  stubEngine(on, ledger)
+  stubBalance(on)
+  await startSession($, on)
+
+  const band = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: BAND_PROPS,
+  })
+  // 进度条按本机累计 3.4 → 40%，不是按本会话的 0
+  expect(await band.find({ text: /40\.0% ¥1/ })).toBeDefined()
+  // 本会话还没走过轮次，所以 token / 估算那一栏不出现
+  expect(await band.find({ text: /↑/ })).toBeUndefined()
+})
+
+test('账本写在 $.fs 的文件里，不再写 $.store', async ($, on) => {
+  mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
+  const ledger = fakeLedger({ spent: 0 })
+  stubEngine(on, ledger)
+  stubBalance(on)
+  on('turn.complete', () => ({ text: '' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  await startSession($, on)
+
+  // 走一轮：账本文件应该被写上（而不是落进 $.store）
+  await $.turn.complete({
+    ...TURN,
+    usage: {
+      ...TURN.usage,
+      input_tokens: 0,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      output_tokens: 262_500,
+    },
+  })
+  // 浮点求和有末位误差，放大到分再比
+  expect(Math.round((ledger.read()?.spent ?? 0) * 100)).toBe(105)
 })

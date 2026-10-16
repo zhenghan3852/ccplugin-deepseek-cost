@@ -434,6 +434,10 @@ async function setupSession($: EngineInterface, cfg: Settings): Promise<void> {
   // 2) 回放上次确认过的模型 —— 横条出不出现就看它
   await restoreModel($)
 
+  // 2b) 把账本里的"本机累计"铺给进度条（它是文件，读一次就够）
+  const ledger = await readGacha($)
+  await update($, machineSpentAtom, () => ledger.spent)
+
   // 3) 拉一次真余额（有缓存也拉，让数字尽快变准）
   await refreshBalance($, cfg)
 
@@ -505,11 +509,14 @@ async function costReport($: EngineInterface, cfg: Settings): Promise<string> {
     return rows.join('\n')
   }
 
-  // 会话花费只有估算这一个口径：余额差额是账户级的，别的会话花掉的钱同样会从
-  // 差额里掉下来，算不到本会话头上。
-  const percent = cyclePercent(usage.estimatedCost, CYCLE_BUDGET)
+  // 两个口径要分开写清楚：
+  //   本会话   —— 只有这一条会话的估算花费（`$.state`，/clear、/resume 会清零）
+  //   本机累计 —— 所有会话加起来（账本），**进度条和抽奖次数都用它**
+  rows.push(`本会话估算  ${moneyFine(usage.estimatedCost, cfg.priceSymbol)}   （只算这一条会话）`)
+  const ledger = await readGacha($)
+  const percent = cyclePercent(ledger.spent, CYCLE_BUDGET)
   rows.push(
-    `本会话估算  ${moneyFine(usage.estimatedCost, cfg.priceSymbol)}   （进度条 ${percent.toFixed(1)}%，每满 ${cfg.priceSymbol}${CYCLE_BUDGET} 得一次抽奖）`,
+    `本机累计    ${moneyFine(ledger.spent, cfg.priceSymbol)}   （所有会话；进度条 ${percent.toFixed(1)}%，每满 ${cfg.priceSymbol}${CYCLE_BUDGET} 得一次抽奖）`,
   )
 
   const hitRate = cacheHitRate(usage)
@@ -540,15 +547,68 @@ const EMPTY_SPIN: Spin = {
 }
 
 const spinAtom = atom({ plugin: 'deepseek-cost-hud', key: 'spin' } as const, EMPTY_SPIN)
+/** 本机累计花费的镜像，给进度条读（每帧读盘太贵）。 */
+const machineSpentAtom = atom({ plugin: 'deepseek-cost-hud', key: 'machineSpent' } as const, 0)
 
-/** 读全局账本。形状不对就当空账本 —— 它跨版本持久化，不能假定一定合法。 */
-async function readGacha($: EngineInterface): Promise<GachaRecord> {
-  const raw = (await $.store.get('gacha')) as Partial<GachaRecord> | undefined
+// ── 抽奖账本（`$.fs` 的文件，不是 `$.store`）─────────────────────────
+//
+// **为什么不用 `$.store`**：它的读是**进程内缓存**的 —— 实测：一个跑着的会话读不到
+// 我从外部写进 store 文件的新键，而文件里确实有。于是长命会话的视图冻结在它启动
+// 那一刻，**它每一次写都会把别的会话的新值覆盖回去** —— 账本会倒退，看起来像被
+// 重置（用户报的"本会话 0.08、draw 却报 0.47"就是这么来的）。所以账本改用 `$.fs`
+// 直接读写文件：**读总是读盘**。
+//
+// 路径是引擎约定的插件数据目录（跨插件升级保留），`$.fs.write` 会自动建父目录。
+
+const LEDGER_DIR = 'deepseek-cost-hud-ccplugin-deepseek-cost'
+
+async function ledgerPath($: EngineInterface): Promise<string> {
+  const home = (await $.env.get('HOME')) ?? ''
+  return `${home}/.claude/plugins/data/${LEDGER_DIR}/gacha.json`
+}
+
+/** 形状不对就当没有 —— 它跨版本持久化，不能假定一定合法。 */
+function parseLedger(value: unknown): GachaRecord | null {
+  if (!value || typeof value !== 'object') return null
+  const r = value as Partial<GachaRecord>
+  if (typeof r.spent !== 'number' || !Number.isFinite(r.spent)) return null
+  if (typeof r.drawn !== 'number' || !Number.isFinite(r.drawn)) return null
   return {
-    spent: typeof raw?.spent === 'number' && Number.isFinite(raw.spent) ? raw.spent : 0,
-    drawn: typeof raw?.drawn === 'number' && Number.isFinite(raw.drawn) ? raw.drawn : 0,
-    owned: raw?.owned && typeof raw.owned === 'object' ? { ...raw.owned } : {},
+    spent: r.spent,
+    drawn: r.drawn,
+    owned: r.owned && typeof r.owned === 'object' ? { ...r.owned } : {},
   }
+}
+
+/** 这次进程里有没有试过迁移。 */
+let migrationTried = false
+
+/** 读账本 —— **每次都读盘**，不吃任何进程缓存。 */
+async function readGacha($: EngineInterface): Promise<GachaRecord> {
+  try {
+    const raw = await $.fs.read(await ledgerPath($))
+    const parsed = parseLedger(JSON.parse(typeof raw === 'string' ? raw : ''))
+    if (parsed) return parsed
+  } catch {
+    // 文件不存在或坏了：走下面的迁移 / 空账本
+  }
+
+  // 一次性迁移：0.10.1 及以前账本存在 `$.store` 里，别让已攒的次数凭空消失
+  if (!migrationTried) {
+    migrationTried = true
+    const legacy = parseLedger(await $.store.get('gacha'))
+    if (legacy) {
+      await writeGacha($, legacy)
+      return legacy
+    }
+  }
+  return { spent: 0, drawn: 0, owned: {} }
+}
+
+/** 写账本（调用方自己先读、合并、再写）。顺手更新进度条用的镜像。 */
+async function writeGacha($: EngineInterface, record: GachaRecord): Promise<void> {
+  await $.fs.write(await ledgerPath($), JSON.stringify(record))
+  await update($, machineSpentAtom, () => record.spent)
 }
 
 /** 每满 ¥1 一次，减掉已经抽掉的。 */
@@ -568,7 +628,7 @@ function ownedLine(record: GachaRecord, tier: TierId): string {
 function dexLines(record: GachaRecord): string[] {
   const collected = ITEMS.filter((item) => (record.owned[item.id] ?? 0) > 0).length
   const rows = [
-    `待抽        ${pendingDraws(record)} 次   （累计花费 ¥${record.spent.toFixed(2)}，每满 ¥1 得一次）`,
+    `待抽        ${pendingDraws(record)} 次   （本机累计 ¥${record.spent.toFixed(2)}，每满 ¥1 得一次）`,
     `已抽        ${record.drawn} 次，图鉴 ${collected}/${ITEMS.length}`,
     '',
   ]
@@ -640,7 +700,7 @@ async function openDrawPane($: EngineInterface): Promise<string> {
   const record = await readGacha($)
   const pending = pendingDraws(record)
   if (pending <= 0) {
-    return `还没有可抽的次数：累计花费 ¥${record.spent.toFixed(2)}，每满 ¥1 得一次。`
+    return `还没有可抽的次数：本机累计 ¥${record.spent.toFixed(2)}，每满 ¥1 得一次。`
   }
 
   await update($, spinAtom, () => ({
@@ -675,7 +735,7 @@ async function beginDraw($: EngineInterface): Promise<void> {
   if (pending <= 0) return
 
   const draw = rollDraw(Math.random)
-  await $.store.set('gacha', {
+  await writeGacha($, {
     spent: record.spent,
     drawn: record.drawn + 1,
     owned: { ...record.owned, [draw.item.id]: (record.owned[draw.item.id] ?? 0) + 1 },
@@ -826,7 +886,7 @@ export const register: Register = (on, options) => {
         // 这一轮的花费也累加进全局账本 —— 每满 ¥1 就多一次抽奖机会。
         // 账本在 $.store（宿主级），所以任意会话花的钱攒的次数都能在任意会话里抽。
         const gacha = await readGacha($)
-        await $.store.set('gacha', { ...gacha, spent: gacha.spent + turnCost })
+        await writeGacha($, { ...gacha, spent: gacha.spent + turnCost })
 
         await update($, usageAtom, prev => ({
           ...prev,
@@ -926,11 +986,11 @@ export const register: Register = (on, options) => {
       )
     }
 
-    // 本会话估算花费的进度条：每满 ¥1 归零重来。走满的每一元换来一次抽奖
-    // 机会，但次数只在命令里显示，所以这里不再标 ×N。
+    // 本机累计的进度条：每满 ¥1 归零，走满的每一元换来一次抽奖机会 ——
+    // 和发次数的口径是同一个（账本），所以"满了就多一次"字面成立。
     let cycleNode: RenderElement | null = null
     if (cfg.showCycle) {
-      const percent = cyclePercent(usage.estimatedCost, CYCLE_BUDGET)
+      const percent = cyclePercent(await read($, machineSpentAtom), CYCLE_BUDGET)
       cycleNode = (
         <Text key="cycle">
           {renderBar(percent)} {percent.toFixed(1)}%
