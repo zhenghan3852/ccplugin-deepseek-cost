@@ -1,8 +1,8 @@
 {
   "name": "deepseek-cost-hud",
   "displayName": "DeepSeek Cost HUD",
-  "version": "0.9.4",
-  "description": "DeepSeek 余额与用量 HUD —— 同时绘制在 Claude Code 终端与 Claude Desktop 输入框上方。配置 API Key：在会话里运行 /deepseek-key（存进系统钥匙串）",
+  "version": "0.10.0",
+  "description": "DeepSeek 余额与用量 HUD —— 同时绘制在 Claude Code 终端与 Claude Desktop 输入框上方。配置 API Key：在会话里运行 /deepseek-key，或直接在横条上的输入框里填",
   "author": {
     "name": "zhenghan3852",
     "url": "https://github.com/zhenghan3852"

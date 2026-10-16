@@ -116,59 +116,46 @@ claude --plugin-dir .
 
 ## 配置 API Key
 
-三种方式，按推荐顺序。
+### 1. 在会话里填（推荐，桌面端也能用）
 
-### 1. 在会话里填：`/deepseek-key`，或者直接在横条上填（推荐，桌面端也能用）
-
-**最省事的：横条自己会让你填。** 余额拿不到的时候（没配 Key，或 Key 不对），横条上**就地**出现一个输入框 —— 粘贴 Key 回车就存进钥匙串，存好之后输入框自动消失、余额立刻出来：
+**最省事的：横条自己会让你填。** 余额拿不到的时候（没配 Key，或 Key 不对），横条上**就地**出现一个输入框 —— 粘贴 Key 回车就存好，存好之后输入框自动消失、余额立刻出来：
 
 ```
-DeepSeek  HTTP 401  ·  [粘贴 Key 回车存入钥匙串]  ·  ░░░░░░░░░░ 0.0% ¥1    隐藏
+DeepSeek  HTTP 401  ·  [粘贴 Key 回车保存（明文）]  ·  ░░░░░░░░░░ 0.0% ¥1    隐藏
 ```
 
 （终端里要先聚焦那条带子才能输入：`ctrl+x tab`；桌面端点一下即可。）
 
-也可以显式跑一条命令，开一个专门的说明面板：
+也可以显式跑一条命令，开一个带说明的面板：
 
 ```
 /deepseek-key
 ```
 
-两条路都写同一处 —— **macOS 钥匙串**：永久有效、不是明文、不进会话记录（不经提示符，也不会被记进 transcript）。
+两条路写的是同一处：**插件自己的存储**（`~/.claude/plugins/store/<插件 id>.json`，权限 0600）。
 
-> **为什么绕这么一圈**：mods API 里**没有**任何一条能写系统凭据库 —— `$.store` 是明文 JSON、`$.fs` 是明文文件、`$.env.set` 只作用于进程。而引擎自己那套会写钥匙串的 userConfig 表单，只存在于**终端版 Claude Code 的 `/plugin` 面板**里；桌面端没有终端 UI，插件也画不进应用的设置窗口。所以插件只能借 macOS 自带的 `security` 命令自己存取钥匙串。
+> ### ⚠️ 这一份是**明文**
 >
-> **代价如实说**：**仅 macOS**。Windows / Linux 上 `security` 不存在，这条路会失败 —— 失败时给的是明确提示（"这台机器上没有 security 命令"），不是原始报错；那边请用下面第 2、3 种。；写入的那一瞬，key 会作为参数出现在进程列表里 —— 只有同一用户能看到，窗口极短。
+> 这是刻意的取舍，不是疏忽。写系统凭据库是**引擎自己的能力** —— mods API 里没有"写凭据库"这条方法（`$.config.set` 只认 `/config` 的行，而敏感字段**不建行**）。插件想同时做到「会话内直接填」和「跨平台」，就只能写明文文件。
 >
-> 注意这是插件自己的钥匙串条目（服务名 `deepseek-cost-hud`），不是引擎的配置，所以 `/plugin` 的 Configure options 里看不到它。两条都配了的话**以引擎那份为准**（它是 `resolveKey` 的第一优先级）。
+> 换来的是：永久有效、不进会话记录、不用开终端、Windows / macOS / Linux 都一样。
 >
-> **为什么不用引擎自己的凭据库**：读的时候就在用 —— `cfg.apiKey` 是第一优先级。卡住的是**写**：mods API 里没有"写系统凭据库"这条方法，`$.config.set` 只认 `/config` 的行，而敏感字段**不建行**（引擎刻意的：密钥只经它自己的 trusted 路径写入）。顺带一个发现：引擎自己在 macOS 上**也是调 `security add-generic-password`**（Windows 上用 `cmdkey`）—— 存储设施跟这里用的完全一样，差别只是"谁在调"。所以这不是换了个存储，而是插件绕过引擎的写入策略，代价就是失去跨平台能力。
+> ### CLI 用户不必用它
+>
+> 你有更好的路：终端会话里 `/plugin` → **Installed** 标签 → 选中插件 → **Configure options** —— 那条路把 key 存进**系统凭据库**（macOS 钥匙串 / Windows 凭据管理器），非明文。等价的无界面写法是 `claude plugin configure <插件> --values-stdin`。
 
-### 2. 终端里一条命令（写进引擎自己的凭据库）
-
-桌面版自带 Claude Code，不需要另装 CLI：
-
-```bash
-CLI=$(ls ~/Library/Application\ Support/Claude*/claude-code/*/*/claude.app/Contents/MacOS/claude | tail -1)
-read -s KEY; echo; printf '{"apiKey":"%s"}' "$KEY" | "$CLI" plugin configure deepseek-cost-hud@ccplugin-deepseek-cost --values-stdin; unset KEY
-```
-
-`read -s` 让 key 输入时不显示、也**不进 shell 历史**；值经 **stdin** 进引擎，写进钥匙串。终端版 Claude Code 用户还可以直接用 `/plugin` → **Installed** → **Configure options** 那个表单。
-
-### 3. 环境变量（兜底）
+### 2. 环境变量（兜底）
 
 | 变量 | 说明 |
 |---|---|
-| `DEEPSEEK_API_KEY` | 最省事的无界面方案。注意**桌面版从 Finder 启动时不继承 shell 环境**，所以它对终端会话更有效；桌面端要持久就用 `~/.claude/settings.json` 的 `env` 块（明文） |
+| `DEEPSEEK_API_KEY` | 最省事的无界面方案。注意**桌面版从 Finder 启动时不继承 shell 环境**，所以它对终端会话更有效；桌面端要持久就用上面第 1 种 |
 | `ANTHROPIC_AUTH_TOKEN` | ⚠️ 只在里面放的是**真的 DeepSeek API Key** 时才有用。走 cc-switch 之类**代理模式**时那里是本地代理令牌（`ccs-...`），打官方接口必然 401 |
 
 ### 查找顺序
 
 ```
-插件配置 apiKey  →  钥匙串（/deepseek-key 存的）  →  DEEPSEEK_API_KEY  →  ANTHROPIC_AUTH_TOKEN
+插件配置 apiKey  →  插件存储（明文，/deepseek-key 或横条输入框写的）  →  DEEPSEEK_API_KEY  →  ANTHROPIC_AUTH_TOKEN
 ```
-
-钥匙串那份每个会话只查一次（不会每 60 秒去起进程）。
 
 ## 命令
 
@@ -177,9 +164,9 @@ read -s KEY; echo; printf '{"apiKey":"%s"}' "$KEY" | "$CLI" plugin configure dee
 | `/deepseek-cost` | 本会话用量明细与估算花费，含进度条位置 |
 | `/deepseek-hud` | 显示 / 隐藏横条 |
 | `/deepseek-refresh` | 立刻刷新余额 |
-| `/deepseek-draw` | 用攒下的次数抽一次奖（像素转盘） |
+| `/deepseek-draw` | 打开抽奖面板：看到还剩几次，点面板上的按钮才开始抽 |
 | `/deepseek-dex` | 看抽奖图鉴：各档收集进度与已抽到的物品 |
-| `/deepseek-key` | 设置 DeepSeek API Key（写进 macOS 钥匙串，永久且非明文） |
+| `/deepseek-key` | 设置 DeepSeek API Key（存进插件自己的存储；CLI 用户请走 Configure options） |
 
 `/deepseek-cost` 的样子：
 
@@ -201,11 +188,15 @@ token       ↑125.3k（缓存命中 15.7M / 未命中 125.3k）  ↓54.4k   共
 每花满 ¥1 得**一次抽奖机会**。次数和图鉴存在宿主的 `$.store` 里，**跨会话共享** —— 在任意会话里花掉的 token 攒下的次数，都能在任意会话里抽。
 
 ```
-/deepseek-draw    抽一次：像素转盘转起来，停在抽中的档位上
+/deepseek-draw    打开抽奖面板：先看到还剩几次，点「开始抽奖」才真的抽
 /deepseek-dex     图鉴：各档收集进度 + 已经抽到过哪些
 ```
 
-两个命令都会开一个**面板**（终端、Desktop、VS Code 都支持），面板放不下时退回文本，信息不丢。**次数是攒着的，不会自动弹** —— 你想抽的时候自己跑命令。
+两个命令都会开一个**面板**（终端、Desktop、VS Code 都支持）。
+
+**抽奖不会被命令替你按下去**：`/deepseek-draw` 只负责开门，面板上先告诉你还剩几次，要**点「开始抽奖」**才真的开抽（开奖后还有「再来一次」，也是点一下一次）。次数是攒着的，不会自动弹，也不会在你不看的时候偷偷扣。
+
+> 面板放不下（窗口太窄）时会告诉你去放宽一点，**不会偷抽** —— 没人点过按钮，一次都不扣。
 
 ### 五个档位与 100 件物品
 
@@ -327,6 +318,7 @@ DeepSeek 官方价目把一天切成两档（据官方 API 文档 *Pricing* 页�
 - **子 agent 的消耗计入总数**：`turn.complete` 对子 agent 的轮次同样触发，那确实是真花掉的钱，所以计入。
 - **余额币种与估算币种不一致时**：两边各自按自己的币种显示，不做换算。人民币账户配人民币价目就一致。
 - **刷新失败时报错优先于缓存**：上一个成功抓到的余额会被缓存起来铺首屏，但一旦刷新失败，横条会显示错误（并把旧数字标成"缓存¥…"），不会拿旧数字冒充当前余额 —— 否则连"该配 Key 了"都看不出来。
+- **Key 是明文存的**：横条输入框和 `/deepseek-key` 写的是插件存储（`~/.claude/plugins/store/<插件 id>.json`，权限 0600）里的 `apiKey`。想非明文就走引擎那条：`/plugin` 的 **Configure options**。**两条都配了以引擎那份为准**（它是查找顺序的第一级）。
 - **余额需要 Key 能通**：Key 拉不到余额时，余额那一栏显示失败原因（如 `HTTP 401`），进度条和 token 仍然照常工作 —— 它们不依赖网络。
 - **抽奖账本没有原子写**：`$.store` 只有读改写、没有 CAS（`$.state` 才有 `ifVersion`），所以多个会话**同一瞬间**同时抽奖理论上会丢一次更新。写入方只有"每轮自动累加"和"手动抽一次"两类，都是人速节奏，撞车窗口是毫秒级，所以没有为它引入更复杂的结构。
 - **物品表是内置的**：加物品、改概率要改代码发版，配置里改不了。

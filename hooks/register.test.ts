@@ -352,7 +352,7 @@ test('转盘是个圆环：中心和四角留空，环上有档位', () => {
   expect(wheelGrid(slots, 0, 20)).not.toEqual(wheelGrid(slots, 0, 0))
 })
 
-test('抽奖：扣一次次数、记进图鉴、开出面板', async ($, on) => {
+test('抽奖：命令只开面板不抽，点「开始抽奖」才真的抽', async ($, on) => {
   mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
   stubEngine(on)
   stubBalance(on)
@@ -365,15 +365,30 @@ test('抽奖：扣一次次数、记进图鉴、开出面板', async ($, on) => 
   await startSession($, on, () => store.stub(on))
 
   const answer = await runCommand($, 'deepseek-draw')
-  expect(answer.text).toMatch(/^抽到了：/)
+  expect(answer.text).toContain('还剩 3 次')
   expect(openCalls).toBe(1)
+  // 命令跑完时账本一点没动 —— 抽奖是人点的，不是命令替人按的
+  expect((store.saved.get('gacha') as { drawn: number }).drawn).toBe(0)
 
+  const pane = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: GACHA_PANE,
+    viewport: { columns: 100, rows: 30 },
+    props: PANE_PROPS,
+  })
+  expect(await pane.find({ text: /还剩 3 次/ })).toBeDefined()
+  expect(await pane.find({ text: '开始抽奖' })).toBeDefined()
+
+  // 点了才抽
+  await pane.press({ key: 'start' })
   const record = store.saved.get('gacha') as { drawn: number; owned: Record<string, number> }
   expect(record.drawn).toBe(1)
   expect(Object.values(record.owned)).toEqual([1])
 })
 
-test('面板放不下时照样开奖，只是不播动画', async ($, on) => {
+test('面板放不下时不偷抽，只回一句可操作的话', async ($, on) => {
   mock.env(on, { DEEPSEEK_API_KEY: 'sk-test' })
   stubEngine(on)
   stubBalance(on)
@@ -382,9 +397,9 @@ test('面板放不下时照样开奖，只是不播动画', async ($, on) => {
   await startSession($, on, () => store.stub(on))
 
   const answer = await runCommand($, 'deepseek-draw')
-  // 次数照扣、东西照到手 —— 动画只是表现层
-  expect(answer.text).toContain('没播动画')
-  expect((store.saved.get('gacha') as { drawn: number }).drawn).toBe(1)
+  expect(answer.text).toContain('放不下面板')
+  // 次数一次都不能扣：没人点过"开始抽奖"
+  expect((store.saved.get('gacha') as { drawn: number }).drawn).toBe(0)
 })
 
 test('没有可抽次数时不抽，也不开面板', async ($, on) => {
@@ -423,6 +438,10 @@ test('转盘逐帧推进，走完停在开奖态', async ($, on) => {
     viewport: { columns: 100, rows: 30 },
     props: PANE_PROPS,
   })
+  expect(await pane.find({ text: '开始抽奖' })).toBeDefined()
+  // 点了按钮才开始转
+  await pane.press({ key: 'start' })
+  await pane.redraw()
   expect(await pane.find({ text: '转动中…' })).toBeDefined()
   // 宽度必须撑住：11×11 全是实心块，拼起来是连续 121 个 —— 一旦被折叠/压窄
   // 就不是这个数（"转盘变扁"那个 bug 的回归护栏，屏幕我看不到，让测试盯着）
@@ -533,7 +552,7 @@ test('模型在第一次回答后才认出来，并记进 store 供后续会话�
   expect(await band.find({ text: '¥40.36' })).toBeDefined()
 })
 
-// ── 设置 Key（写进 macOS 钥匙串）──────────────────────────────────────
+// ── 设置 Key（写进插件自己的存储，明文）──────────────────────────────
 
 /** 面板的 props（设置 Key 那个）。 */
 const KEY_PANE_PROPS = {
@@ -545,18 +564,18 @@ const KEY_PANE_PROPS = {
   view: {},
 }
 
-test('设置 Key：面板里回车 → 写进钥匙串并回报成功', async ($, on) => {
-  mock.env(on, {})
+test('设置 Key：面板里回车 → 存进插件存储，并立刻拿它刷余额', async ($, on) => {
+  mock.env(on, {}) // 环境里没有任何 key
   stubEngine(on)
-  stubBalance(on)
-  const runs: string[][] = []
-  on('process.run', ($, e) => {
-    runs.push([...e.argv])
-    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  let sentAuth = ''
+  on('http.fetch', { url: /\/user\/balance$/ }, ($, e) => {
+    sentAuth = String(e.init?.headers?.Authorization ?? '')
+    return { value: { status: 200, ok: true, headers: {}, text: BALANCE_BODY } }
   })
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.invalidate', () => ({ value: undefined }))
-  await startSession($, on)
+  const store = fakeStore({ lastModel: 'deepseek-flash' })
+  await startSession($, on, () => store.stub(on))
   await runCommand($, 'deepseek-key')
 
   const pane = await $.ui.mount({
@@ -570,54 +589,14 @@ test('设置 Key：面板里回车 → 写进钥匙串并回报成功', async ($
   expect(await pane.find({ text: /DeepSeek API Key/ })).toBeDefined()
 
   await pane.input({ key: 'key', text: 'sk-from-pane' })
-  const write = runs.find((argv) => argv.includes('add-generic-password'))
-  expect(write).toEqual([
-    'security',
-    'add-generic-password',
-    '-U',
-    '-s',
-    'deepseek-cost-hud',
-    '-a',
-    'apiKey',
-    '-w',
-    'sk-from-pane',
-  ])
-  expect(await pane.find({ text: /已存入钥匙串/ })).toBeDefined()
+  // 存进插件存储（明文 JSON）并回报成功
+  expect(store.saved.get('apiKey')).toBe('sk-from-pane')
+  expect(await pane.find({ text: /已保存/ })).toBeDefined()
+  // 而且立刻用它刷了一次余额
+  expect(sentAuth).toBe('Bearer sk-from-pane')
 })
 
-test('设置 Key：写失败就说失败，不假装成功', async ($, on) => {
-  mock.env(on, {})
-  stubEngine(on)
-  stubBalance(on)
-  on('process.run', () => ({
-    value: {
-      exitCode: 1,
-      stdout: '',
-      stderr: 'errSecAuthFailed',
-      isStdoutTruncated: false,
-      isStderrTruncated: false,
-    },
-  }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('ui.invalidate', () => ({ value: undefined }))
-  await startSession($, on)
-  await runCommand($, 'deepseek-key')
-
-  const pane = await $.ui.mount({
-    plugin: PLUGIN,
-    surface: 'terminal',
-    component: 'Pane',
-    requestId: 'deepseek-key',
-    viewport: { columns: 100, rows: 24 },
-    props: KEY_PANE_PROPS,
-  })
-  await pane.input({ key: 'key', text: 'sk-nope' })
-  expect(await pane.find({ text: /没存进去：errSecAuthFailed/ })).toBeDefined()
-  expect(await pane.find({ text: /已存入钥匙串/ })).toBeUndefined()
-})
-
-test('钥匙串里的 key 优先于环境变量 —— 真的用在余额请求上', async ($, on) => {
-  // 环境里有真 key 和代理令牌，但钥匙串里那份应该赢
+test('插件存储里的 key 优先于环境变量 —— 真的用在余额请求上', async ($, on) => {
   mock.env(on, { DEEPSEEK_API_KEY: 'sk-from-env', ANTHROPIC_AUTH_TOKEN: 'ccs-proxy' })
   stubEngine(on)
   let sentAuth = ''
@@ -625,38 +604,18 @@ test('钥匙串里的 key 优先于环境变量 —— 真的用在余额请求�
     sentAuth = String(e.init?.headers?.Authorization ?? '')
     return { value: { status: 200, ok: true, headers: {}, text: BALANCE_BODY } }
   })
-  on('process.run', () => ({
-    value: {
-      exitCode: 0,
-      stdout: 'sk-from-keychain\n',
-      stderr: '',
-      isStdoutTruncated: false,
-      isStderrTruncated: false,
-    },
-  }))
-  await startSession($, on)
-
-  expect(sentAuth).toBe('Bearer sk-from-keychain')
+  const store = fakeStore({ lastModel: 'deepseek-flash', apiKey: 'sk-from-store' })
+  await startSession($, on, () => store.stub(on))
+  expect(sentAuth).toBe('Bearer sk-from-store')
 })
 
 test('余额拿不到时，横条上就地出现 Key 输入框', async ($, on) => {
   mock.env(on, {}) // 没有任何来源的 Key
   stubEngine(on)
   stubBalance(on)
-  const runs: string[][] = []
-  on('process.run', ($, e) => {
-    runs.push([...e.argv])
-    return {
-      value: {
-        exitCode: 0,
-        stdout: '',
-        stderr: '',
-        isStdoutTruncated: false,
-        isStderrTruncated: false,
-      },
-    }
-  })
-  await startSession($, on)
+  on('ui.invalidate', () => ({ value: undefined }))
+  const store = fakeStore({ lastModel: 'deepseek-flash' })
+  await startSession($, on, () => store.stub(on))
 
   const band = await $.ui.mount({
     plugin: PLUGIN,
@@ -668,20 +627,9 @@ test('余额拿不到时，横条上就地出现 Key 输入框', async ($, on) =
   expect(await band.find({ text: '未配置 Key' })).toBeDefined()
   expect(await band.find({ type: 'Input' })).toBeDefined()
 
-  // 在横条里输入即可写进钥匙串 —— 不用另开面板
+  // 在横条里输入即可存进插件存储 —— 不用另开面板
   await band.input({ key: 'key', text: 'sk-from-band' })
-  const write = runs.find((argv) => argv.includes('add-generic-password'))
-  expect(write).toEqual([
-    'security',
-    'add-generic-password',
-    '-U',
-    '-s',
-    'deepseek-cost-hud',
-    '-a',
-    'apiKey',
-    '-w',
-    'sk-from-band',
-  ])
+  expect(store.saved.get('apiKey')).toBe('sk-from-band')
 })
 
 test('余额正常时横条上没有 Key 输入框', async ($, on) => {
@@ -748,26 +696,3 @@ test('刷新失败时不拿缓存冒充余额：横条报错并给出 Key 输入
   expect(report.text).toContain('HTTP 401')
 })
 
-test('非 macOS：写钥匙串失败时给的是可操作的提示，不是原始报错', async ($, on) => {
-  mock.env(on, {})
-  stubEngine(on)
-  stubBalance(on)
-  // Windows/Linux 上没有 security 命令 —— $.process.run 会拒绝
-  on('process.run', () => ({ deny: 'spawn security ENOENT' }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('ui.invalidate', () => ({ value: undefined }))
-  await startSession($, on)
-  await runCommand($, 'deepseek-key')
-
-  const pane = await $.ui.mount({
-    plugin: PLUGIN,
-    surface: 'terminal',
-    component: 'Pane',
-    requestId: 'deepseek-key',
-    viewport: { columns: 100, rows: 24 },
-    props: KEY_PANE_PROPS,
-  })
-  await pane.input({ key: 'key', text: 'sk-x' })
-  expect(await pane.find({ text: /没有 security 命令/ })).toBeDefined()
-  expect(await pane.find({ text: /ENOENT/ })).toBeUndefined()
-})
