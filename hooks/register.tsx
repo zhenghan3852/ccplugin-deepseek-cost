@@ -33,8 +33,6 @@
 
 import { atom, read, update } from 'claude-code'
 import type {
-  ConfigRow,
-  ConfigValue,
   EngineInterface,
   PluginOptions,
   Register,
@@ -466,7 +464,6 @@ function dexLines(record: GachaRecord): string[] {
 // Svg 只有 Desktop，单实现都用不了。
 
 const GACHA_PANE = 'deepseek-gacha'
-const CONFIG_PANE = 'deepseek-config'
 const DEX_PANE = 'deepseek-dex'
 
 /**
@@ -483,97 +480,6 @@ const CELL = '█'
 const POINTER_MARK = '▼'
 
 let spinTimer: { cancel: () => void } | null = null
-
-// ── 配置面板 ────────────────────────────────────────────────────────
-//
-// 桌面端的 Settings → Plugins 页不给插件留位置（渲染站点全在会话内），所以
-// 配置界面只能自己画：`$.config.list()` 读、`$.config.set()` 写。
-//
-// 两件事如实写在面板上，不假装能做：
-//   · API Key 不在其中 —— 它标了 sensitive，引擎不给敏感字段建 `/config` 行
-//   · 改动要 /reload-plugins 才生效 —— 配置是 register() 时一次性读走的
-
-/** 本插件的名字（清单里的 `name`）。 */
-const PLUGIN_NAME = 'deepseek-cost-hud'
-
-/**
- * 本插件的 userConfig 行。
- *
- * key 的形式是 `<pluginId>.<字段>`，而 pluginId 是**带 marketplace 的完整 id**
- * （`deepseek-cost-hud@ccplugin-deepseek-cost`）—— 这里是踩过的坑：第一版按
- * `deepseek-cost-hud.` 前缀过滤，一个都没匹配上，面板只剩表头没有控件。
- * 现在两种写法都认。
- */
-function ownConfigRows(rows: readonly ConfigRow[]): ConfigRow[] {
-  return rows.filter((row) => {
-    const owner = row.key.split('.')[0] ?? ''
-    return owner === PLUGIN_NAME || owner.startsWith(`${PLUGIN_NAME}@`)
-  })
-}
-
-/** 行 key 去掉 `<pluginId>.` 之后的字段名。 */
-function configField(key: string): string {
-  const owner = key.split('.')[0] ?? ''
-  return key.slice(owner.length + 1)
-}
-
-/** 配置值上屏的写法。 */
-function configValueText(value: ConfigValue): string {
-  return Array.isArray(value) ? value.join(', ') : String(value)
-}
-
-/** 输入框的文本按该行的类型落地；数字行给了非数字就原样退回旧值。 */
-function parseConfigInput(row: ConfigRow, text: string): ConfigValue {
-  if (row.kind !== 'number') return text
-  const parsed = Number(text)
-  return Number.isFinite(parsed) ? parsed : row.value
-}
-
-/** 写回一个配置项，并让面板重画（写状态不行 —— 那是渲染钩子里的事）。 */
-async function setConfig($: EngineInterface, key: string, value: ConfigValue): Promise<void> {
-  const result = await $.config.set({ key, value })
-  if (result.deny) {
-    $.ui.toast(`没改成：${result.deny}`)
-    return
-  }
-  await $.ui.invalidate('ui.render')
-}
-
-/** 打开配置面板；返回给命令说的那句话。 */
-async function openConfigPane($: EngineInterface): Promise<string> {
-  const opened = await $.ui.open({
-    id: CONFIG_PANE,
-    title: '插件配置',
-    focus: true,
-    closeOnEscape: true,
-    columns: 46,
-    rows: 28,
-  })
-  if (!opened.isPlaced) {
-    return '面板放不下。改配置请走 /plugin 的 Configure options，或 shell 里 claude plugin configure。'
-  }
-  return '配置面板已打开；改完运行 /reload-plugins 生效。'
-}
-
-/**
- * 把 Key 设进**本会话的进程环境**：就地可用，且不落盘、不进提示符、不进
- * transcript（这是它能做到的、比明文存储安全的地方）。
- *
- * 代价说清楚：`$.env.set` 只作用于进程，所以**只对本会话有效**，重启或新会话
- * 要重填。要一次配好且持久，用 shell 的 `claude plugin configure`（写进系统
- * 凭据库）。两条都不落明文。
- */
-async function setSessionKey(
-  $: EngineInterface,
-  cfg: Settings,
-  typed: string,
-): Promise<void> {
-  const key = typed.trim()
-  if (!key) return
-  await $.env.set('DEEPSEEK_API_KEY', key)
-  await refreshBalance($, cfg)
-  await $.ui.invalidate('ui.render')
-}
 
 /** 推进一帧；走完就停在开奖态并停表。 */
 async function advanceSpin($: EngineInterface): Promise<void> {
@@ -715,10 +621,6 @@ export const register: Register = (on, options) => {
       name: 'deepseek-dex',
       description: '看抽奖图鉴：各档收集进度与已抽到的物品',
     })
-    await $.command.register({
-      name: 'deepseek-config',
-      description: '在会话里改插件配置（API Key 除外，面板上有说明）',
-    })
 
     // 3) 拉一次真实余额（有缓存也拉，让数字尽快变准），再回放上次确认的模型
     await refreshBalance($, cfg)
@@ -825,10 +727,6 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'deepseek-draw' }, async ($) => ({ text: await startDraw($) }))
 
   on('command.run', { command: 'deepseek-dex' }, async ($) => ({ text: await openDexPane($) }))
-
-  on('command.run', { command: 'deepseek-config' }, async ($) => ({
-    text: await openConfigPane($),
-  }))
 
   // ── 横条本体 ──────────────────────────────────────────────────────
   // AbovePrompt 只在 terminal 和 desktop 两个 surface 上拉起，所以这一个钩子
@@ -983,85 +881,6 @@ export const register: Register = (on, options) => {
           ) : null}
           <Button key="close" label="关闭" onPress={() => void $.ui.close({ id: GACHA_PANE })} />
         </Box>
-      </Box>
-    )
-  })
-
-  // ── 配置面板 ──────────────────────────────────────────────────────
-
-  on('ui.render', { component: 'Pane' }, async ($, e, next) => {
-    if (e.requestId !== CONFIG_PANE) return next(e)
-
-    const all = await $.config.list()
-    const rows = ownConfigRows(all)
-    const elements = $.ui.resolve(e)
-    // 元素表按 surface 给，是个联合类型：有的 surface 没有 Input / Select。
-    // 真遇到就交回引擎自己画，别硬撑一个改不了的配置面板。
-    if (!('Input' in elements) || !('Select' in elements)) return next(e)
-    const { Box, Text, Button, Input, Select } = elements
-
-    const controls = rows.map((row) => {
-      const name = configField(row.key)
-      let control: RenderElement
-      if (row.kind === 'boolean') {
-        control = (
-          <Button
-            key={`v-${name}`}
-            label={row.value === true ? '开' : '关'}
-            onPress={() => void setConfig($, row.key, row.value !== true)}
-          />
-        )
-      } else if (row.kind === 'choice') {
-        control = (
-          <Select
-            key={`v-${name}`}
-            options={(row.options ?? []).map((value) => ({ value }))}
-            value={configValueText(row.value)}
-            onSelect={(value) => void setConfig($, row.key, value)}
-          />
-        )
-      } else {
-        control = (
-          <Input
-            key={`v-${name}`}
-            value={configValueText(row.value)}
-            onSubmit={(text) => void setConfig($, row.key, parseConfigInput(row, text))}
-          />
-        )
-      }
-      return (
-        <Box key={row.key} flexDirection="row" gap={1}>
-          <Text>{row.label}</Text>
-          {control}
-        </Box>
-      )
-    })
-
-    return (
-      <Box flexDirection="column">
-        <Text bold>插件配置</Text>
-        {controls}
-        {rows.length === 0 ? (
-          // 空的时候把引擎实际报的行 key 印出来 —— 免得又一次"面板一片空白、
-          // 看不出是过滤条件错了还是真没有"，那是我上一版栽的坑。
-          <Text dimColor>
-            （没读到本插件的配置行。引擎报回来的是：
-            {all.map((row) => row.key).join('  ') || '空列表'}）
-          </Text>
-        ) : null}
-        <Box flexDirection="row" gap={1}>
-          <Text>API Key（本会话）</Text>
-          {/* 故意不给 value：提交后输入框自己清空，Key 不会停在画面上 */}
-          <Input
-            key="v-apiKey"
-            placeholder="sk-… 回车保存"
-            onSubmit={(text) => void setSessionKey($, cfg, text)}
-          />
-        </Box>
-        <Text dimColor>上面这行只对本会话有效、不落盘、不进会话记录 —— 重启或新会话要重填</Text>
-        <Text dimColor>要一次配好且持久：shell 里 claude plugin configure，值进系统凭据库</Text>
-        <Text dimColor>改完配置项记得运行 /reload-plugins 生效（配置是插件加载时读的）</Text>
-        <Button key="close" label="关闭" onPress={() => void $.ui.close({ id: CONFIG_PANE })} />
       </Box>
     )
   })

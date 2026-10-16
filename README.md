@@ -116,27 +116,42 @@ claude --plugin-dir .
 
 ## 配置 API Key
 
-**只推荐一种：填插件配置项。** 这个字段在清单里标了 `sensitive`，所以值是进**系统凭据库**（macOS 钥匙串）的 —— 既不写进 `settings.json`，也不会出现在会话记录里。
+**先说结论：桌面端没有配置界面，必须开一次终端跑一条命令。** 这是平台的限制，不是插件的缺陷 —— 已查证：
 
-| 你在哪用 | 怎么填 |
+| 事实 | 依据 |
 |---|---|
-| 终端 | 会话里 `/plugin configure deepseek-cost-hud`，或 `/plugin` → **Installed** 标签 → 选中插件 → **Configure options** |
-| 桌面端 | 输入框旁的 **+** → **Plugins** → **Manage plugins** → 选中插件 → **Configure options** |
-| 不想开界面 | shell 里 `claude plugin configure deepseek-cost-hud --values-stdin`，stdin 传一个 JSON（如 `{"apiKey":"sk-..."}`） |
+| 插件只能画在**会话内** | 引擎的渲染站点一共 15 个，全在会话里（`AbovePrompt`/`Pane`/`CommandOutput`…），没有一个是应用设置窗口 |
+| 桌面端 Settings → Plugins 的插件页只显示 `description` 和它**自己枚举**的组件（Skills / Commands / Connectors / Hooks / Agents） | 那些标签来自插件**静态声明的文件**（`skills/`、`commands/`、`.mcp.json`…）；本插件的命令是运行时注册的，所以那页只有一个 Overview |
+| 应用代码里搜 `Configure options` 是 **0 次**（而 `Update now`、`Uninstall` 都在） | 引擎文档里那个配置对话框只存在于**终端的 `/plugin` 面板**，Electron 应用里没有实现 |
 
-> `/config` 面板里看不到这个字段 —— 引擎把敏感选项从 `/config` 里排除了，只有上表那几条路。
-
-填不了界面时的两条环境变量回退，按优先级：
-
-2. `DEEPSEEK_API_KEY` —— 最省事的无界面方案：
+### 可靠做法：开一个终端，一条命令
 
 ```bash
-export DEEPSEEK_API_KEY="sk-xxxxxxxxxxxxxxxx"
+echo '{"apiKey":"sk-xxxxxxxxxxxxxxxx"}' | claude plugin configure deepseek-cost-hud@ccplugin-deepseek-cost --values-stdin
 ```
 
-3. `ANTHROPIC_AUTH_TOKEN` —— ⚠️ 只在里面放的是**真的 DeepSeek API Key** 时才有用。用 cc-switch 之类的工具走**代理模式**时，那里放的是本地代理令牌（形如 `ccs-...`），拿去打官方接口只会得到 401。
+或者交互式（会列出所有选项）：`claude plugin configure deepseek-cost-hud@ccplugin-deepseek-cost`
 
-> **为什么去掉了 `/deepseek-key`**：它把 key 明文写进插件自己的 store JSON，还会因为你把 key 敲在提示符里而**留在会话记录（transcript）中**。统一走配置项后，key 只进系统凭据库。
+值写进**系统凭据库**（macOS 钥匙串）：不落 `settings.json`、不进会话记录。**配置按用户存**，所以终端配一次，桌面端的会话也读得到 —— 一次配好，永久生效。
+
+### 没有终端可用时
+
+给 `~/.claude/settings.json` 加一个 `env` 块：
+
+```json
+{
+  "env": { "DEEPSEEK_API_KEY": "sk-xxxxxxxxxxxxxxxx" }
+}
+```
+
+Claude Code 会把它注入每个会话，插件经 `$.env.get` 读到。代价是**明文**（权限取决于文件本身），所以能用上面那条命令就别用这条。
+
+### 两条回退（按优先级）
+
+2. `DEEPSEEK_API_KEY` 环境变量 —— 注意**桌面版从 Finder 启动时不继承 shell 环境**，所以这条主要对终端会话有效；桌面端要持久就用上面那个 `env` 块。
+3. `ANTHROPIC_AUTH_TOKEN` —— ⚠️ 只在里面放的是**真的 DeepSeek API Key** 时才有用。走 cc-switch 之类的**代理模式**时，那里放的是本地代理令牌（形如 `ccs-...`），拿去打官方接口只会得到 401。
+
+> **历史**：早先有个 `/deepseek-key` 命令，把 key 明文写进插件自己的 store JSON，还会因为你把 key 敲在提示符里而**留在会话记录中** —— 已删除。也试过在会话内面板里收 key，但 `$.env.set` 只作用于进程、重启就没了，不够用，同样删掉了。key 只该进系统凭据库。
 
 ---
 
@@ -149,7 +164,6 @@ export DEEPSEEK_API_KEY="sk-xxxxxxxxxxxxxxxx"
 | `/deepseek-refresh` | 立刻刷新余额 |
 | `/deepseek-draw` | 用攒下的次数抽一次奖（像素转盘） |
 | `/deepseek-dex` | 看抽奖图鉴：各档收集进度与已抽到的物品 |
-| `/deepseek-config` | 在会话里改插件配置（API Key 除外，见下） |
 
 `/deepseek-cost` 的样子：
 
@@ -219,28 +233,17 @@ token       ↑125.3k（缓存命中 15.7M / 未命中 125.3k）  ↓54.4k   共
 
 ## 配置项
 
-改配置有三条路，按场景挑：
+改配置**只有终端一条路**（原因见上面「配置 API Key」那节的查证）：
 
-| 场景 | 怎么改 |
+| 想改什么 | 怎么改 |
 |---|---|
-| 在会话里，想随手点着改 | **`/deepseek-config`** —— 开一个会话内面板，见下 |
-| 要改 **API Key** | `/plugin` → **Installed** 标签 → 插件 → **Configure options**；或 shell 里 `claude plugin configure deepseek-cost-hud --values-stdin`。`/deepseek-config` 改不了它（见下） |
-| 写进文件 | `settings.json` 的 `pluginConfigs`（注意敏感值不走这里） |
+| **API Key** | `claude plugin configure deepseek-cost-hud@ccplugin-deepseek-cost --values-stdin` —— 值进系统凭据库 |
+| 其它任何一项（开关、单价、币种…） | 同一条命令（`--values-stdin` 传 `{"priceOutput": 9}` 这样的 JSON），或终端会话里的 `/plugin` → **Installed** 标签 → **Configure options** |
+| 不想用命令 | 手改 `~/.claude/settings.json` 的 `pluginConfigs`，键是**插件 id**：`"deepseek-cost-hud@ccplugin-deepseek-cost": { "options": { "showCycle": false } }`。**敏感值不要走这里** —— 引擎只从系统凭据库读敏感值 |
 
-### 在会话里改配置：`/deepseek-config`
-
-```
-/deepseek-config
-```
-
-开一个面板，列出本插件所有**非敏感**的配置项，按类型给对应控件：开关给按钮、`choice` 给选择器、数字和文本给输入框。改动通过 `$.config.set()` 写回，被拒时弹提示而不是假装成功。
-
-两条如实写在面板上的限制：
-
-- **API Key 不在其中。** 它标了 `sensitive`，引擎不给敏感字段建 `/config` 行，所以读不到也写不了。Key 只能走上面表格里那条安全路径 —— 这本来就是对的，Key 不该经提示符。
-- **改完要 `/reload-plugins` 才生效。** 配置是插件加载时一次性读走的（`register()` 里 `readSettings(options)`），所以会话中途改的值要到重载后才起作用。
-
-> 为什么要自己画这个面板：桌面端的 **Settings → Plugins** 页不给插件留位置 —— 引擎的渲染站点一共 15 个，全在**会话内**（`AbovePrompt`、`Pane`、`CommandOutput`…），没有一个能画进应用设置窗口。所以"在会话里开一个面板"是能做到的最接近的形态。
+> 改完要**重开一个会话**（终端里 `/reload-plugins`）才生效 —— 配置是插件加载时一次性读走的。
+>
+> 试过在会话内画一个配置面板（`$.config.list()` / `$.config.set()` 都可用）：它改不了 Key（敏感字段没有 `/config` 行），能改的那几项本来一条命令就能解决，反而多一份要维护的界面，所以删掉了。
 
 配置项一览：
 
