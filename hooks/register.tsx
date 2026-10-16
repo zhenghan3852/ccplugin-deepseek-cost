@@ -304,6 +304,16 @@ async function readKeychainKey($: EngineInterface): Promise<string> {
   }
 }
 
+/**
+ * 把"这条命令不存在"翻译成人话 —— Windows / Linux 上就撞这个。
+ * 那边没有 `security`，只能走引擎自己的凭据库或环境变量。
+ */
+function explainProcessFailure(message: string): string {
+  return /ENOENT|not found|no such file|command not found/i.test(message)
+    ? '这台机器上没有 security 命令（它只有 macOS 有）—— 改用终端里的 claude plugin configure，或设 DEEPSEEK_API_KEY'
+    : message
+}
+
 /** 写进钥匙串（`-U` = 已存在就更新）。返回空串表示成功，否则是失败原因。 */
 async function writeKeychainKey($: EngineInterface, key: string): Promise<string> {
   try {
@@ -324,7 +334,7 @@ async function writeKeychainKey($: EngineInterface, key: string): Promise<string
     keychainKey = key
     return ''
   } catch (err) {
-    return messageOf(err).slice(0, 120)
+    return explainProcessFailure(messageOf(err)).slice(0, 200)
   }
 }
 

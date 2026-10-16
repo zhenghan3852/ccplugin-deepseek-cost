@@ -747,3 +747,27 @@ test('刷新失败时不拿缓存冒充余额：横条报错并给出 Key 输入
   expect(report.text).toContain('缓存值')
   expect(report.text).toContain('HTTP 401')
 })
+
+test('非 macOS：写钥匙串失败时给的是可操作的提示，不是原始报错', async ($, on) => {
+  mock.env(on, {})
+  stubEngine(on)
+  stubBalance(on)
+  // Windows/Linux 上没有 security 命令 —— $.process.run 会拒绝
+  on('process.run', () => ({ deny: 'spawn security ENOENT' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.invalidate', () => ({ value: undefined }))
+  await startSession($, on)
+  await runCommand($, 'deepseek-key')
+
+  const pane = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'deepseek-key',
+    viewport: { columns: 100, rows: 24 },
+    props: KEY_PANE_PROPS,
+  })
+  await pane.input({ key: 'key', text: 'sk-x' })
+  expect(await pane.find({ text: /没有 security 命令/ })).toBeDefined()
+  expect(await pane.find({ text: /ENOENT/ })).toBeUndefined()
+})
